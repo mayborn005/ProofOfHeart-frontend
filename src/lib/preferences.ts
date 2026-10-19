@@ -1,42 +1,70 @@
+import { getItem, setItem, getRawItem, setRawItem } from "./localStorageStore";
+
+export type NotificationFrequency = "instant" | "daily" | "weekly";
+export type NotificationChannel = "inApp" | "email";
+
 export interface NotificationPreferences {
   contributions: boolean;
   verified: boolean;
   refundAvailable: boolean;
   revenueDeposited: boolean;
+  frequency: NotificationFrequency;
+  channels: NotificationChannel[];
 }
 
 const STORAGE_KEY_PREFIX = "notif_prefs_";
+const VALID_FREQUENCIES: NotificationFrequency[] = ["instant", "daily", "weekly"];
+const VALID_CHANNELS: NotificationChannel[] = ["inApp", "email"];
 
-const DEFAULTS: NotificationPreferences = {
+const DEFAULTS: NotificationPreferences = Object.freeze<NotificationPreferences>({
   contributions: true,
   verified: true,
   refundAvailable: true,
   revenueDeposited: true,
-};
+  frequency: "instant",
+  channels: ["inApp"],
+});
+
+function isNotificationFrequency(value: unknown): value is NotificationFrequency {
+  return typeof value === "string" && VALID_FREQUENCIES.includes(value as NotificationFrequency);
+}
+
+function isNotificationChannels(value: unknown): value is NotificationChannel[] {
+  return (
+    Array.isArray(value) &&
+    value.every((channel) => VALID_CHANNELS.includes(channel as NotificationChannel))
+  );
+}
 
 export function getNotificationPreferences(walletAddress: string): NotificationPreferences {
-  if (typeof window === "undefined") return { ...DEFAULTS };
-  try {
-    const raw = localStorage.getItem(`${STORAGE_KEY_PREFIX}${walletAddress.toLowerCase()}`);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      return { ...DEFAULTS, ...parsed };
-    }
-  } catch {
-    // ignore corrupt data
-  }
-  return { ...DEFAULTS };
+  const key = `${STORAGE_KEY_PREFIX}${walletAddress.trim().toLowerCase()}`;
+  const parsed = getItem<Partial<NotificationPreferences>>(key) ?? {};
+
+  return {
+    ...DEFAULTS,
+    ...parsed,
+    frequency: isNotificationFrequency(parsed?.frequency) ? parsed.frequency : DEFAULTS.frequency,
+    channels: isNotificationChannels(parsed?.channels) ? parsed.channels : DEFAULTS.channels,
+  };
 }
 
 export function setNotificationPreferences(
   walletAddress: string,
   prefs: NotificationPreferences,
 ): void {
-  if (typeof window === "undefined") return;
-  localStorage.setItem(
-    `${STORAGE_KEY_PREFIX}${walletAddress.toLowerCase()}`,
-    JSON.stringify(prefs),
-  );
+  const normalizedWallet = walletAddress.trim();
+  if (!normalizedWallet) {
+    throw new Error("Wallet address is required");
+  }
+
+  const nextPrefs: NotificationPreferences = {
+    ...prefs,
+    channels: prefs.channels.filter((channel): channel is NotificationChannel =>
+      VALID_CHANNELS.includes(channel),
+    ),
+  };
+
+  setItem(`${STORAGE_KEY_PREFIX}${normalizedWallet.toLowerCase()}`, nextPrefs);
 }
 
 export const THEME_STORAGE_KEY = "theme";
@@ -51,20 +79,12 @@ export function isTheme(value: string | null | undefined): value is Theme {
 }
 
 export function readStoredTheme(): Theme | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  const stored = localStorage.getItem(THEME_STORAGE_KEY);
+  const stored = getRawItem(THEME_STORAGE_KEY);
   return isTheme(stored) ? stored : null;
 }
 
 export function writeStoredTheme(theme: Theme): void {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  localStorage.setItem(THEME_STORAGE_KEY, theme);
+  setRawItem(THEME_STORAGE_KEY, theme);
 }
 
 export function resolveThemeFromSystem(): Theme {
@@ -84,23 +104,54 @@ export function hasStoredTheme(): boolean {
 }
 
 export function writeLocalePreference(locale: string): void {
-  if (typeof window === "undefined") {
-    return;
-  }
+  const normalized = locale.trim();
+  if (!normalized) return;
 
-  localStorage.setItem(LOCALE_STORAGE_KEY, locale);
-  document.cookie = `${LOCALE_COOKIE_NAME}=${encodeURIComponent(locale)}; path=/; max-age=${LOCALE_COOKIE_MAX_AGE}; SameSite=Lax`;
+  setRawItem(LOCALE_STORAGE_KEY, normalized);
+
+  if (typeof document !== "undefined") {
+    // `Secure` cookies are dropped by browsers (and jsdom) over plain http, so
+    // only add the flag on https — otherwise the locale never persists on
+    // localhost / http deployments.
+    const secure = window.location.protocol === "https:" ? "; Secure" : "";
+    document.cookie = `${LOCALE_COOKIE_NAME}=${encodeURIComponent(normalized)}; path=/; max-age=${LOCALE_COOKIE_MAX_AGE}; SameSite=Lax${secure}`;
+  }
 }
 
 export function readStoredLocale(): string | null {
-  if (typeof window === "undefined") {
-    return null;
-  }
-
-  return localStorage.getItem(LOCALE_STORAGE_KEY);
+  return getRawItem(LOCALE_STORAGE_KEY);
 }
 
 /** Inline script applied before React hydrates to avoid theme FOUC. */
 export function getThemeBlockingScript(): string {
-  return `(function(){try{var stored=localStorage.getItem('${THEME_STORAGE_KEY}');var isDark=stored==='dark'||(!stored&&window.matchMedia('(prefers-color-scheme: dark)').matches);if(isDark){document.documentElement.classList.add('dark');}else{document.documentElement.classList.remove('dark');}}catch(e){}})();`;
+  return `
+    (function () {
+      try {
+        const storageKey = ${JSON.stringify(THEME_STORAGE_KEY)};
+        const storedTheme = window.localStorage.getItem(storageKey);
+        const prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        const isDark = storedTheme === "dark" || (!storedTheme && prefersDark);
+
+        if (isDark) {
+          document.documentElement.dataset.theme = "dark";
+        }
+      } catch {
+        // Storage may be disabled or blocked. Graceful fallback.
+      }
+    })();
+  `;
+}
+
+/** Minimum touch target size in pixels compliant with WCAG 2.1 Success Criterion 2.5.5 / 2.5.8 */
+export const MIN_TOUCH_TARGET_SIZE_PX = 44;
+
+export function isAccessibleTouchTarget(width: number, height: number): boolean {
+  return width >= MIN_TOUCH_TARGET_SIZE_PX && height >= MIN_TOUCH_TARGET_SIZE_PX;
+}
+
+export function getTouchTargetStyles(): { minWidth: string; minHeight: string } {
+  return {
+    minWidth: `${MIN_TOUCH_TARGET_SIZE_PX}px`,
+    minHeight: `${MIN_TOUCH_TARGET_SIZE_PX}px`,
+  };
 }

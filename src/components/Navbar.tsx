@@ -13,6 +13,7 @@ import LanguageSwitcher from "./LanguageSwitcher";
 import NotificationBell from "./NotificationBell";
 import NotificationSettings from "./NotificationSettings";
 import { useCampaigns } from "@/hooks/useCampaigns";
+import { useSavedCampaignsCount } from "@/hooks/useSavedCampaigns";
 import { useContractVersion } from "@/hooks/useContractVersion";
 import { IS_MOCK_MODE } from "@/lib/runtimeEnv";
 
@@ -21,6 +22,14 @@ export default function Navbar() {
   const [mounted, setMounted] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const menuToggleButtonRef = useRef<HTMLButtonElement>(null);
+  const connectButtonRef = useRef<HTMLButtonElement>(null);
+
+  // #1214 — a rejected/closed Freighter prompt must hand focus back to the
+  // trigger so the retry is reachable with Tab/Enter only.
+  const handleConnect = async () => {
+    await connectWallet();
+    connectButtonRef.current?.focus();
+  };
 
   useEffect(() => {
     setMounted(true);
@@ -37,6 +46,7 @@ export default function Navbar() {
   const { theme, toggleTheme } = useTheme();
   const pathname = usePathname();
   const t = useTranslations("Common");
+  const savedCount = useSavedCampaignsCount();
   const { admin: adminAddress } = useAdmin();
   const { isMismatch, version, expectedVersion } = useContractVersion();
 
@@ -168,6 +178,15 @@ export default function Navbar() {
                       {pendingCount}
                     </span>
                   )}
+                  {link.href === "/profile" && savedCount > 0 && (
+                    <span
+                      data-testid="saved-count-badge"
+                      aria-label={`${savedCount} saved campaigns`}
+                      className="ms-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-blue-500 px-1 text-[10px] font-bold text-white"
+                    >
+                      {savedCount}
+                    </span>
+                  )}
                 </span>
                 <span
                   className={`absolute bottom-1 start-4 end-4 h-0.5 bg-blue-500 transition-transform origin-left rtl:origin-right ${
@@ -221,14 +240,15 @@ export default function Navbar() {
             {!isWalletConnected ? (
               <button
                 type="button"
-                onClick={connectWallet}
+                ref={connectButtonRef}
+                onClick={handleConnect}
                 disabled={isLoading}
                 className="h-10 items-center justify-center rounded-full bg-linear-to-r from-red-500 to-pink-500 px-6 text-sm font-bold text-white transition-all hover:motion-safe:scale-105 hover:shadow-lg active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed shadow-md shadow-red-500/20"
               >
                 {isLoading ? t("connecting") : t("connectWallet")}
               </button>
             ) : (
-              <div className="flex items-center gap-3 pl-2">
+              <div className="flex items-center gap-3 ps-2">
                 <Link
                   href="/causes/new"
                   className="inline-flex items-center gap-1.5 h-9 px-3 lg:px-4 rounded-full bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 transition-colors shadow-sm shadow-blue-500/20"
@@ -309,6 +329,14 @@ export default function Navbar() {
                           {link.href === "/admin" && pendingCount > 0 && (
                             <span className="ms-auto flex h-5 min-w-5 items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white">
                               {pendingCount}
+                            </span>
+                          )}
+                          {link.href === "/profile" && savedCount > 0 && (
+                            <span
+                              aria-label={`${savedCount} saved campaigns`}
+                              className="ms-auto flex h-5 min-w-5 items-center justify-center rounded-full bg-blue-500 px-1 text-[10px] font-bold text-white"
+                            >
+                              {savedCount}
                             </span>
                           )}
                         </span>

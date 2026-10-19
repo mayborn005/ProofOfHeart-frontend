@@ -27,6 +27,60 @@ import { isFreighterLockedError } from "@/utils/freighterErrors";
 import InstallFreighterModal from "./InstallFreighterModal";
 import SocialLoginButtons from "./SocialLoginButtons";
 
+/**
+ * Session-scoped storage key for the wallet public key.
+ *
+ * Moved from localStorage to sessionStorage (#1139) so the cached address is
+ * automatically discarded when the tab is closed.  Only the public key (not a
+ * secret) is stored here — all transaction signing is handled by Freighter or
+ * the in-memory social wallet keypair.
+ */
+const WALLET_STORAGE_KEY = "stellar_wallet_public_key";
+
+/**
+ * One-time migration: move any legacy localStorage value into sessionStorage
+ * and remove it from localStorage.  This runs once per page load.
+ */
+function migrateWalletKeyToSessionStorage(): void {
+  if (typeof window === "undefined") return;
+  try {
+    const legacy = window.localStorage.getItem(WALLET_STORAGE_KEY);
+    if (legacy) {
+      window.sessionStorage.setItem(WALLET_STORAGE_KEY, legacy);
+      window.localStorage.removeItem(WALLET_STORAGE_KEY);
+    }
+  } catch {
+    // Storage may be unavailable in some environments (e.g. private browsing).
+  }
+}
+
+function readWalletKey(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.sessionStorage.getItem(WALLET_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeWalletKey(key: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(WALLET_STORAGE_KEY, key);
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
+function removeWalletKey(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.sessionStorage.removeItem(WALLET_STORAGE_KEY);
+  } catch {
+    // Ignore storage removal failures.
+  }
+}
+
 interface WalletContextType {
   publicKey: string | null;
   isWalletConnected: boolean;
@@ -59,10 +113,13 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
   const { showError, showWarning, showSuccess } = useToast();
   const queryClient = useQueryClient();
   const previousPublicKeyRef = useRef<string | null>(null);
+  /** #560 — Tracks whether the install prompt was already surfaced by polling. */
+  const installPromptSurfacedRef = useRef(false);
   // #649 — The Freighter poll below runs on a timer and would tear down a social
   // session the moment it saw the extension reporting "not connected". A ref
   // rather than the state value because the poll closes over its first render.
   const isSocialSessionRef = useRef(false);
+  const connectInFlightRef = useRef(false);
   const appNetworkPassphrase = process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE || "";
   const appNetworkLabel = appNetworkPassphrase.includes("Public Global")
     ? "Mainnet"
@@ -71,9 +128,10 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
       : "the app network";
 
   useEffect(() => {
+    migrateWalletKeyToSessionStorage();
+
     if (IS_MOCK_MODE) {
-      const storedKey =
-        typeof window !== "undefined" ? localStorage.getItem("stellar_wallet_public_key") : null;
+      const storedKey = readWalletKey();
       if (storedKey) {
         setPublicKey(storedKey);
         setIsWalletConnected(true);
@@ -140,8 +198,7 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
     if (isSocialSessionRef.current) return;
 
     if (IS_MOCK_MODE) {
-      const storedKey =
-        typeof window !== "undefined" ? localStorage.getItem("stellar_wallet_public_key") : null;
+      const storedKey = readWalletKey();
       if (storedKey) {
         setPublicKey(storedKey);
         setIsWalletConnected(true);
@@ -160,6 +217,9 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
       const { isConnected: connected } = await isConnected();
       const { isAllowed: allowed } = await isAllowed();
       if (connected && allowed) {
+        // Freighter is present and authorised — dismiss any lingering install prompt.
+        setShowInstallPrompt(false);
+        installPromptSurfacedRef.current = false;
         const key = await getAddress();
         const network = await getNetwork();
         const walletNetworkPassphrase = network.networkPassphrase || "";
@@ -170,7 +230,7 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
           setWalletNetworkWarning(
             `Switch Freighter to ${appNetworkLabel} to continue. Current wallet network does not match the app network.`,
           );
-          localStorage.removeItem("stellar_wallet_public_key");
+          removeWalletKey();
           // Invalidate queries on network mismatch
           invalidateWalletQueries();
           return;
@@ -181,7 +241,7 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
         setPublicKey(newPublicKey);
         setIsWalletConnected(true);
         setWalletKind("freighter");
-        localStorage.setItem("stellar_wallet_public_key", newPublicKey);
+        writeWalletKey(newPublicKey);
 
         // Detect account change and invalidate wallet-scoped queries
         if (
@@ -196,7 +256,7 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
         setPublicKey(null);
         setIsWalletConnected(false);
         setWalletKind(null);
-        localStorage.removeItem("stellar_wallet_public_key");
+        removeWalletKey();
         // Invalidate queries when disconnected
         if (previousPublicKeyRef.current !== null) {
           invalidateWalletQueries();
@@ -208,11 +268,24 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
       setPublicKey(null);
       setIsWalletConnected(false);
       setWalletKind(null);
-      localStorage.removeItem("stellar_wallet_public_key");
+      removeWalletKey();
       // Invalidate queries on error
       if (previousPublicKeyRef.current !== null) {
         invalidateWalletQueries();
         previousPublicKeyRef.current = null;
+      }
+
+      // #560 — the Freighter API throws when the extension is not installed.
+      // Surface the install prompt so the user gets a clear CTA instead of
+      // silently staying disconnected. A ref (not state) guards against
+      // redundant checks because checkWalletConnection is stable-closured.
+      if (!isSocialSessionRef.current && !installPromptSurfacedRef.current) {
+        void isFreighterInstalled().then((installed) => {
+          if (!installed) {
+            installPromptSurfacedRef.current = true;
+            setShowInstallPrompt(true);
+          }
+        });
       }
     }
   };
@@ -236,6 +309,8 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
   };
 
   const connectWallet = async () => {
+    if (connectInFlightRef.current) return;
+    connectInFlightRef.current = true;
     setIsLoading(true);
     try {
       if (IS_MOCK_MODE) {
@@ -247,7 +322,7 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
         setIsWalletConnected(true);
         setWalletKind("freighter");
         setWalletNetworkWarning(null);
-        localStorage.setItem("stellar_wallet_public_key", mockAddress);
+        writeWalletKey(mockAddress);
         previousPublicKeyRef.current = mockAddress;
         showSuccess("Mock wallet connected successfully.");
         return;
@@ -290,7 +365,7 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
       setPublicKey(key.address);
       setIsWalletConnected(true);
       setWalletKind("freighter");
-      localStorage.setItem("stellar_wallet_public_key", key.address);
+      writeWalletKey(key.address);
       showSuccess("Wallet connected successfully.");
     } catch (error) {
       setPublicKey(null);
@@ -304,6 +379,7 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
         showError("Failed to connect wallet. Please try again.");
       }
     } finally {
+      connectInFlightRef.current = false;
       setIsLoading(false);
     }
   };
@@ -355,7 +431,7 @@ export const WalletProvider = ({ children }: { children: ReactNode }) => {
     setWalletKind(null);
     setWalletNetworkWarning(null);
     setSocialProfile(null);
-    localStorage.removeItem("stellar_wallet_public_key");
+    removeWalletKey();
     // Invalidate wallet-scoped queries on disconnect
     invalidateWalletQueries();
     previousPublicKeyRef.current = null;

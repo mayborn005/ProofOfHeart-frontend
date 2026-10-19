@@ -8,8 +8,7 @@ import { Link } from "@/i18n/routing";
 import { useMemo } from "react";
 import { useTranslations } from "next-intl";
 
-// Fix Leaflet default marker icon (broken in bundlers)
-// https://github.com/Leaflet/Leaflet/issues/4968
+
 const defaultIcon = L.icon({
   iconUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png",
   iconRetinaUrl: "https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png",
@@ -63,9 +62,10 @@ export function filterByValidCoordinates(
 
 interface CampaignMapProps {
   campaigns: Campaign[];
+  isLoading?: boolean;
 }
 
-export default function CampaignMap({ campaigns }: CampaignMapProps) {
+export default function CampaignMap({ campaigns, isLoading = false }: CampaignMapProps) {
   const t = useTranslations("CampaignMap");
   const validCampaigns = useMemo(
     () => filterByValidCoordinates(Array.isArray(campaigns) ? campaigns : []),
@@ -78,6 +78,39 @@ export default function CampaignMap({ campaigns }: CampaignMapProps) {
     const lngSum = validCampaigns.reduce((s, c) => s + c.longitude, 0);
     return [latSum / validCampaigns.length, lngSum / validCampaigns.length];
   }, [validCampaigns]);
+
+  if (isLoading) {
+    return (
+      <div className="rounded-xl overflow-hidden border border-zinc-200 dark:border-zinc-700">
+        <div className="h-[500px] w-full flex items-center justify-center bg-zinc-50 dark:bg-zinc-800">
+          <div className="flex flex-col items-center gap-3">
+            <svg
+              className="w-8 h-8 text-blue-500 animate-spin"
+              xmlns="http://www.w3.org/2000/svg"
+              fill="none"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <circle
+                className="opacity-25"
+                cx="12"
+                cy="12"
+                r="10"
+                stroke="currentColor"
+                strokeWidth="4"
+              />
+              <path
+                className="opacity-75"
+                fill="currentColor"
+                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+              />
+            </svg>
+            <span className="text-sm text-zinc-500 dark:text-zinc-400">{t("loading")}</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (validCampaigns.length === 0) {
     return (
@@ -104,7 +137,7 @@ export default function CampaignMap({ campaigns }: CampaignMapProps) {
               <div className="min-w-[180px]">
                 <Link
                   href={`/causes/${campaign.id}`}
-                  className="font-semibold text-blue-600 hover:underline block mb-1"
+                  className="font-semibold text-blue-600 hover:underline block mb-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 rounded"
                 >
                   {campaign.title}
                 </Link>

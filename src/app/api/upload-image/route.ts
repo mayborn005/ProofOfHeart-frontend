@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { pinImageToIpfs } from "@/lib/ipfsUpload";
-import { validateImageFile } from "@/lib/imageValidation";
+import { validateAltText, validateImageFile } from "@/lib/imageValidation";
 
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX = 5;
@@ -29,6 +29,19 @@ export async function POST(req: NextRequest) {
   const file = formData.get("file");
   if (!file || !(file instanceof File)) {
     return NextResponse.json({ message: "file is required" }, { status: 400 });
+  }
+
+  const altTextValue = formData.get("altText");
+  const altText = typeof altTextValue === "string" ? altTextValue : undefined;
+
+  // Alt text is required for accessibility: a missing form field yields
+  // `undefined`, which `validateAltText` rejects the same way as a blank value.
+  const altValidation = validateAltText(altText);
+  if (!altValidation.valid) {
+    return NextResponse.json(
+      { message: altValidation.error ?? "Alt text is required for accessibility" },
+      { status: 400 },
+    );
   }
 
   const validation = validateImageFile(file);

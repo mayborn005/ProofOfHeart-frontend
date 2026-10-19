@@ -1,7 +1,7 @@
 "use client";
 
-import Image from "next/image";
 import { memo, useState } from "react";
+import LazyImage from "./LazyImage";
 import { Bookmark } from "lucide-react";
 import { useLocale } from "next-intl";
 import { formatAddress } from "@/lib/formatAddress";
@@ -21,6 +21,7 @@ import VotingComponent from "./VotingComponent";
 import { useSavedCampaigns } from "@/hooks/useSavedCampaigns";
 
 interface CauseCardProps {
+  priority?: boolean;
   campaign: Campaign;
   userWalletAddress: string | null;
   onVote: (campaignId: number, voteType: "upvote" | "downvote") => Promise<void>;
@@ -44,6 +45,7 @@ function formatDate(ts: number, locale: string) {
 }
 
 function CauseCard({
+  priority = false,
   campaign,
   userWalletAddress,
   onVote,
@@ -114,17 +116,14 @@ function CauseCard({
   };
 
   return (
-    <div className="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm transition-transform duration-200 hover:motion-safe:-translate-y-0.5 hover:border-blue-200 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:border-blue-800">
+    <article className="flex h-full flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-sm transition-transform duration-200 hover:motion-safe:-translate-y-0.5 hover:border-blue-200 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:border-blue-800">
       {/* ── Cover image ── */}
       <div className="relative w-full aspect-video bg-zinc-100 dark:bg-zinc-700">
         {campaign.cover_image_url ? (
-          <Image
+          <LazyImage
             src={campaign.cover_image_url}
             alt={campaign.title}
-            fill
-            unoptimized
-            loading="lazy"
-            className="object-cover"
+            className="absolute inset-0 w-full h-full object-cover"
           />
         ) : (
           <div className="absolute inset-0 flex items-center justify-center text-4xl select-none">
@@ -277,7 +276,7 @@ function CauseCard({
         onConfirm={handleCancelConfirm}
         onClose={() => setIsCancelModalOpen(false)}
       />
-    </div>
+    </article>
   );
 }
 
@@ -291,6 +290,7 @@ function causeCardPropsAreEqual(prev: CauseCardProps, next: CauseCardProps): boo
   const nextCampaign = next.campaign;
 
   return (
+    prev.priority === next.priority &&
     prev.userWalletAddress === next.userWalletAddress &&
     prev.userVote === next.userVote &&
     prev.upvotes === next.upvotes &&

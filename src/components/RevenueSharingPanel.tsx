@@ -1,8 +1,14 @@
 "use client";
 
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useLocale } from "next-intl";
-import { claimRevenue, depositRevenue } from "../lib/contractClient";
+import { claimCreatorRevenue, claimRevenue, depositRevenue } from "../lib/contractClient";
+import {
+  creatorClaimableAmount,
+  creatorRevenueEntitlement,
+  readCreatorClaimed,
+  writeCreatorClaimed,
+} from "../lib/revenueShare";
 import { Campaign, Category, basisPointsToPercentage } from "../types";
 import { xlmToStroops } from "@/lib/stellarAmount";
 import { formatAmount } from "@/lib/formatters";
@@ -48,6 +54,17 @@ export default function RevenueSharingPanel({
 
   const isCreator = isSameAddress(publicKey, campaign.creator);
   const canShowCreatorControls = showCreatorControls && isCreator;
+
+  // Creator's retained share: pool × (10,000 − contributor share bps) / 10,000, minus prior claims.
+  const creatorEntitlement = creatorRevenueEntitlement(
+    revenuePool,
+    campaign.revenue_share_percentage,
+  );
+  const [creatorClaimed, setCreatorClaimed] = useState(BigInt(0));
+  useEffect(() => {
+    setCreatorClaimed(readCreatorClaimed(campaign.id, isCreator ? publicKey : null));
+  }, [campaign.id, isCreator, publicKey]);
+  const creatorClaimable = creatorClaimableAmount(creatorEntitlement, creatorClaimed);
   const canShowContributorControls = showContributorControls && !!publicKey;
   const hasContribution = contribution > BigInt(0);
 
@@ -121,6 +138,39 @@ export default function RevenueSharingPanel({
     }
   };
 
+  const handleCreatorClaim = async () => {
+    if (!publicKey) {
+      showWarning("Connect your wallet to claim revenue.");
+      return;
+    }
+
+    setIsPending(true);
+    setTxPhase(null);
+    try {
+      await claimCreatorRevenue(campaign.id, publicKey, {
+        onStatus: ({ phase }) => setTxPhase(phase),
+      });
+      writeCreatorClaimed(campaign.id, publicKey, creatorEntitlement);
+      setCreatorClaimed(creatorEntitlement);
+      refetch();
+      onActionSuccess?.();
+      showSuccess("Creator revenue claimed successfully.");
+    } catch (err) {
+      const message = parseContractError(err);
+      if (message.includes("NoFundsToWithdraw")) {
+        // Everything was already paid out (e.g. from another browser): resync the display.
+        writeCreatorClaimed(campaign.id, publicKey, creatorEntitlement);
+        setCreatorClaimed(creatorEntitlement);
+        showWarning("There is no creator revenue left to claim.");
+      } else {
+        showError(message);
+      }
+    } finally {
+      setIsPending(false);
+      setTxPhase(null);
+    }
+  };
+
   const containerClassName =
     variant === "dashboard"
       ? "rounded-2xl border border-emerald-200/70 bg-emerald-50/70 p-5 dark:border-emerald-900 dark:bg-emerald-950/30"
@@ -146,7 +196,10 @@ export default function RevenueSharingPanel({
             <p className="text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
               Total Pool
             </p>
-            <Tooltip content="The total amount of revenue that has been deposited into this campaign's revenue pool available for all contributors to claim." />
+            <Tooltip
+              label="About the total pool"
+              content="The total amount of revenue that has been deposited into this campaign's revenue pool available for all contributors to claim."
+            />
           </div>
           <p className="mt-2 text-xl font-semibold text-zinc-900 dark:text-zinc-50">
             {formatXlm(revenuePool)} XLM
@@ -158,6 +211,7 @@ export default function RevenueSharingPanel({
               Your Share
             </p>
             <Tooltip
+              label="About your share"
               content={`Your proportional share of the revenue pool based on your ${contributorSharePercentage}% contribution to the campaign. Calculated as: (your contribution ÷ total raised) × total pool.`}
             />
           </div>
@@ -170,7 +224,10 @@ export default function RevenueSharingPanel({
             <p className="text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
               Already Claimed
             </p>
-            <Tooltip content="The total amount of revenue you have already claimed from your share. This is deducted from your total share to calculate the claimable amount." />
+            <Tooltip
+              label="About the amount already claimed"
+              content="The total amount of revenue you have already claimed from your share. This is deducted from your total share to calculate the claimable amount."
+            />
           </div>
           <p className="mt-2 text-xl font-semibold text-zinc-900 dark:text-zinc-50">
             {formatXlm(claimed)} XLM
@@ -181,7 +238,10 @@ export default function RevenueSharingPanel({
             <p className="text-xs font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
               Claimable Now
             </p>
-            <Tooltip content="The amount of revenue you can claim right now. This is your share minus what you've already claimed." />
+            <Tooltip
+              label="About the claimable amount"
+              content="The amount of revenue you can claim right now. This is your share minus what you've already claimed."
+            />
           </div>
           <p className="mt-2 text-xl font-semibold text-emerald-700 dark:text-emerald-300">
             {formatXlm(claimable)} XLM
@@ -194,7 +254,10 @@ export default function RevenueSharingPanel({
           <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
             Pro-rata calculation
           </p>
-          <Tooltip content="Your revenue share is calculated proportionally based on your contribution to the campaign. The formula is: (your contribution ÷ total raised) × available pool = your claimable share." />
+          <Tooltip
+            label="About the pro-rata calculation"
+            content="Your revenue share is calculated proportionally based on your contribution to the campaign. The formula is: (your contribution ÷ total raised) × available pool = your claimable share."
+          />
         </div>
         <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">{breakdown}</p>
       </div>
@@ -284,6 +347,41 @@ export default function RevenueSharingPanel({
                 : "Deposit Revenue"}
             </button>
           </form>
+          <div className="mt-5 border-t border-zinc-200/80 pt-4 dark:border-zinc-700">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+                  Creator revenue
+                </p>
+                <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                  Your retained share is{" "}
+                  {basisPointsToPercentage(10_000 - campaign.revenue_share_percentage)} of the pool
+                  ({formatXlm(creatorEntitlement)} XLM). Claimable now:{" "}
+                  <span
+                    data-testid="creator-claimable"
+                    className="font-semibold text-emerald-700 dark:text-emerald-300"
+                  >
+                    {formatXlm(creatorClaimable)} XLM
+                  </span>
+                  .
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleCreatorClaim()}
+                disabled={isPending || creatorClaimable <= BigInt(0)}
+                className="inline-flex shrink-0 items-center justify-center rounded-full bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-700 disabled:cursor-not-allowed disabled:bg-zinc-400"
+              >
+                {isPending
+                  ? txPhase === "signing"
+                    ? "Signing..."
+                    : txPhase === "confirming"
+                      ? "Confirming..."
+                      : "Processing..."
+                  : "Claim Creator Revenue"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </section>

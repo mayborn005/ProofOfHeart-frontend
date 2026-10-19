@@ -2,6 +2,44 @@
 
 import { getWalletTransactions, type WalletTransactionLogEntry } from "./transactionLog";
 import { normalizeAddress } from "./stellar";
+import { getArray, setArray } from "./localStorageStore";
+import { AppNotificationSchema, NotificationFeedResponseSchema, parseWithOrNull } from "./schemas";
+
+// ARIA live region for screen reader announcements
+let ariaLiveRegion: HTMLElement | null = null;
+
+function getAriaLiveRegion(): HTMLElement {
+  if (!ariaLiveRegion && typeof document !== "undefined") {
+    ariaLiveRegion = document.getElementById("notification-announcer") ||
+      createAriaLiveRegion();
+  }
+  return ariaLiveRegion!;
+}
+
+function createAriaLiveRegion(): HTMLElement {
+  const region = document.createElement("div");
+  region.id = "notification-announcer";
+  region.setAttribute("aria-live", "polite");
+  region.setAttribute("aria-atomic", "true");
+  region.className = "sr-only";
+  region.style.position = "absolute";
+  region.style.left = "-10000px";
+  region.style.width = "1px";
+  region.style.height = "1px";
+  region.style.overflow = "hidden";
+  document.body.appendChild(region);
+  return region;
+}
+
+export function announceNotification(message: string): void {
+  try {
+    const region = getAriaLiveRegion();
+    region.textContent = message;
+  } catch {
+    // Graceful fallback for SSR or missing DOM
+    console.log("[a11y announcement]", message);
+  }
+}
 
 export type NotificationEventType =
   | "contribution_confirmed"
@@ -31,33 +69,15 @@ export interface NotificationFeedResponse {
 const REMOTE_FEED_ENDPOINT = "/api/notifications";
 const READ_STATE_KEY_PREFIX = "proof_of_heart_notifications_read_v1";
 
-function canUseStorage(): boolean {
-  return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
-}
-
 function readNotificationIds(walletAddress: string): string[] {
-  if (!canUseStorage()) return [];
-  try {
-    const key = `${READ_STATE_KEY_PREFIX}:${normalizeAddress(walletAddress)}`;
-    const raw = window.localStorage.getItem(key);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed)
-      ? parsed.filter((value): value is string => typeof value === "string")
-      : [];
-  } catch {
-    return [];
-  }
+  const key = `${READ_STATE_KEY_PREFIX}:${normalizeAddress(walletAddress)}`;
+  const ids = getArray<string>(key);
+  return ids.filter((value): value is string => typeof value === "string");
 }
 
 function writeNotificationIds(walletAddress: string, ids: string[]): void {
-  if (!canUseStorage()) return;
-  try {
-    const key = `${READ_STATE_KEY_PREFIX}:${normalizeAddress(walletAddress)}`;
-    window.localStorage.setItem(key, JSON.stringify(ids.slice(-250)));
-  } catch {
-    // Ignore localStorage write failures.
-  }
+  const key = `${READ_STATE_KEY_PREFIX}:${normalizeAddress(walletAddress)}`;
+  setArray(key, ids, 250);
 }
 
 function walletActionToNotification(
@@ -102,7 +122,10 @@ function walletActionToNotification(
   }
 }
 
-async function fetchRemoteNotifications(walletAddress: string): Promise<AppNotification[] | null> {
+async function fetchRemoteNotifications(
+  walletAddress: string,
+  signal?: AbortSignal,
+): Promise<AppNotification[] | null> {
   try {
     const url = new URL(REMOTE_FEED_ENDPOINT, window.location.origin);
     url.searchParams.set("walletAddress", walletAddress);
@@ -112,6 +135,7 @@ async function fetchRemoteNotifications(walletAddress: string): Promise<AppNotif
         Accept: "application/json",
       },
       cache: "no-store",
+      signal,
     });
 
     if (!response.ok) {
@@ -119,10 +143,26 @@ async function fetchRemoteNotifications(walletAddress: string): Promise<AppNotif
       return null;
     }
 
-    const payload = (await response.json()) as NotificationFeedResponse | AppNotification[];
-    const notifications = Array.isArray(payload) ? payload : payload.notifications;
+    const raw: unknown = await response.json();
+
+    // Accept either `{ notifications: [...] }` or a bare array.
+    let notifications: AppNotification[];
+    if (Array.isArray(raw)) {
+      notifications = raw
+        .map((item) => parseWithOrNull(AppNotificationSchema, "AppNotificationSchema", item))
+        .filter((item): item is AppNotification => item !== null);
+    } else {
+      const feed = parseWithOrNull(
+        NotificationFeedResponseSchema,
+        "NotificationFeedResponseSchema",
+        raw,
+      );
+      if (!feed) return null;
+      notifications = feed.notifications;
+    }
+
     return notifications
-      .filter((item): item is AppNotification => Boolean(item && item.id && item.href))
+      .filter((item) => Boolean(item.id && item.href))
       .map((item) => ({
         ...item,
         read: Boolean(item.read),
@@ -151,11 +191,14 @@ function deriveLocalNotifications(walletAddress: string): AppNotification[] {
     .filter(Boolean) as AppNotification[];
 }
 
-export async function fetchNotifications(walletAddress: string): Promise<AppNotification[]> {
+export async function fetchNotifications(
+  walletAddress: string,
+  signal?: AbortSignal,
+): Promise<AppNotification[]> {
   const normalizedWallet = normalizeAddress(walletAddress);
   if (!normalizedWallet) return [];
 
-  const remoteNotifications = await fetchRemoteNotifications(normalizedWallet);
+  const remoteNotifications = await fetchRemoteNotifications(normalizedWallet, signal);
   const notifications = remoteNotifications ?? deriveLocalNotifications(normalizedWallet);
   const readIds = readNotificationIds(normalizedWallet);
 

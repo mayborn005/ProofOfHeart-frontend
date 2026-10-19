@@ -13,28 +13,28 @@ const TEST_NEW_ADMIN = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD
 function makeScValHelpers() {
   const scVal = {
     u32(value: number) {
-      return { u32: () => value };
+      return { u32: () => value, toXDR: () => `u32:${value}` };
     },
     u64(value: number) {
-      return { u64: () => BigInt(value) };
+      return { u64: () => BigInt(value), toXDR: () => `u64:${value}` };
     },
     bool(value: boolean) {
-      return { b: () => value };
+      return { b: () => value, toXDR: () => `bool:${value}` };
     },
     str(value: string) {
-      return { str: () => ({ toString: () => value }) };
+      return { str: () => ({ toString: () => value }), toXDR: () => `str:${value}` };
     },
     bigint(value: bigint | number) {
-      return { __bigint: BigInt(value) };
+      return { __bigint: BigInt(value), toXDR: () => `i128:${BigInt(value)}` };
     },
     address(value: string) {
-      return { __address: value };
+      return { __address: value, toXDR: () => `address:${value}` };
     },
     symbol(value: string) {
-      return { sym: () => ({ toString: () => value }) };
+      return { sym: () => ({ toString: () => value }), toXDR: () => `symbol:${value}` };
     },
     vec(values: unknown[]) {
-      return { vec: () => values };
+      return { vec: () => values, toXDR: () => `vec:${values.length}` };
     },
     map(fields: Record<string, unknown>) {
       return {
@@ -85,10 +85,10 @@ async function loadClient(options: LoadClientOptions) {
   let txCounter = 0;
 
   const mockServer = {
-    getAccount: jest.fn().mockResolvedValue({
-      accountId: () => TEST_ADMIN,
+    getAccount: jest.fn().mockImplementation(async (publicKey: string) => ({
+      accountId: () => publicKey,
       sequenceNumber: () => "1",
-    }),
+    })),
     simulateTransaction: jest
       .fn()
       .mockImplementation((tx: { ops?: Array<{ method?: string }> }) => {
@@ -99,6 +99,16 @@ async function loadClient(options: LoadClientOptions) {
         const method = tx.ops?.[0]?.method;
         if (method === "get_campaign_count") return { result: { retval: scVal.u32(1) } };
         if (method === "get_campaign") return { result: { retval: campaignFixture } };
+        if (
+          method === "list_campaigns" ||
+          method === "get_campaigns_by_category" ||
+          method === "get_creator_campaigns"
+        ) {
+          // (Vec<Campaign>, next_cursor): a single short page holding one campaign.
+          return {
+            result: { retval: scVal.vec([scVal.vec([campaignFixture]), scVal.u32(1)]) },
+          };
+        }
         if (method === "get_contribution") return { result: { retval: scVal.bigint(100_000_000) } };
         if (method === "get_revenue_pool") return { result: { retval: scVal.bigint(500_000_000) } };
         if (method === "get_revenue_claimed")
@@ -123,8 +133,11 @@ async function loadClient(options: LoadClientOptions) {
     })),
   };
 
+  const serverUrls: string[] = [];
+
   class MockServer {
-    constructor() {
+    constructor(url: string) {
+      serverUrls.push(url);
       return mockServer;
     }
   }
@@ -154,6 +167,14 @@ async function loadClient(options: LoadClientOptions) {
       private readonly _id: string,
       private readonly _seq: string,
     ) {}
+
+    accountId() {
+      return this._id;
+    }
+
+    sequenceNumber() {
+      return this._seq;
+    }
   }
 
   class MockTransactionBuilder {
@@ -220,6 +241,7 @@ async function loadClient(options: LoadClientOptions) {
       assembleTransaction: jest.fn().mockImplementation(() => ({
         build: () => ({
           toXDR: () => "prepared-xdr",
+          fee: "4321",
         }),
       })),
     },
@@ -234,7 +256,7 @@ async function loadClient(options: LoadClientOptions) {
   }));
 
   const module = await import("../../lib/contractClient");
-  return { module, mockServer, stellarSdkMock };
+  return { module, mockServer, stellarSdkMock, serverUrls };
 }
 
 describe("contractClient", () => {
@@ -322,6 +344,108 @@ describe("contractClient", () => {
     expect(decoded.tags).toEqual(["education", "impact"]);
   });
 
+  it("createCampaign encodes tags into the off-chain POH_EXT blob on the non-mock path", async () => {
+    const { module, mockServer } = await loadClient({ useMocks: false });
+
+    await module.createCampaign(
+      TEST_USER,
+      "On-chain campaign",
+      "Description",
+      BigInt(1_000_000_000),
+      30,
+      Category.Learner,
+      false,
+      0,
+      ["alpha", "beta"],
+    );
+
+    const createCall = mockServer.simulateTransaction.mock.calls.find(
+      ([tx]: [{ ops?: Array<{ method?: string }> }]) => tx.ops?.[0]?.method === "create_campaign",
+    );
+    expect(createCall).toBeDefined();
+
+    const [tx] = createCall as [{ ops: Array<{ args: unknown[] }> }];
+    const descriptionScVal = tx.ops[0].args[2] as { str: () => { toString: () => string } };
+    const finalDescription = descriptionScVal.str().toString();
+
+    expect(finalDescription).toContain("===POH_EXT===");
+    const ext = JSON.parse(finalDescription.split("===POH_EXT===\n")[1]);
+    expect(ext.tags).toEqual(["alpha", "beta"]);
+
+    // The contract itself never receives tags as a direct argument — it only
+    // accepts the 8 fields the issue's schema lists.
+    expect(tx.ops[0].args).toHaveLength(8);
+  });
+
+  it("rejects campaign creation before simulation when the creator account does not exist", async () => {
+    const { module, mockServer } = await loadClient({ useMocks: false });
+    mockServer.getAccount.mockRejectedValueOnce(new Error("404 account not found"));
+
+    await expect(
+      module.createCampaign(
+        TEST_USER,
+        "On-chain campaign",
+        "Description",
+        BigInt(1_000_000_000),
+        30,
+        Category.Learner,
+        false,
+        0,
+        [],
+      ),
+    ).rejects.toThrow("Creator account does not exist on the Stellar network.");
+    expect(mockServer.simulateTransaction).not.toHaveBeenCalled();
+  });
+
+  it("estimates contribution fees from the RPC-assembled transaction", async () => {
+    const { module, mockServer } = await loadClient({ useMocks: false });
+
+    await expect(
+      module.estimateContributeNetworkFee(7, TEST_USER, BigInt(50_000_000)),
+    ).resolves.toBe(4321n);
+    expect(mockServer.simulateTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ops: [expect.objectContaining({ method: "contribute" })],
+      }),
+    );
+    expect(mockServer.sendTransaction).not.toHaveBeenCalled();
+  });
+
+  it("decodeCampaign parses tags from the off-chain POH_EXT blob when the contract map has no tags field", async () => {
+    const { module } = await loadClient({ useMocks: true });
+    const scVal = makeScValHelpers();
+
+    const description = `Real description\n\n===POH_EXT===\n${JSON.stringify({
+      tags: ["water", "rural"],
+      coverImageUrl: "https://example.com/cover.png",
+    })}`;
+
+    const fixtureWithoutContractTags = scVal.map({
+      id: scVal.u32(9),
+      creator: scVal.address(TEST_ADMIN),
+      title: scVal.str("No-tags-field campaign"),
+      description: scVal.str(description),
+      funding_goal: scVal.bigint(500_000_000),
+      deadline: scVal.u64(1_900_000_000),
+      amount_raised: scVal.bigint(0),
+      is_active: scVal.bool(true),
+      created_at: scVal.u64(1_800_000_000),
+      funds_withdrawn: scVal.bool(false),
+      is_cancelled: scVal.bool(false),
+      is_verified: scVal.bool(false),
+      category: scVal.u32(Category.Publisher),
+      has_revenue_sharing: scVal.bool(false),
+      revenue_share_percentage: scVal.u32(0),
+      // Deliberately no `tags` field, matching the real contract's schema.
+    });
+
+    const decoded = module.__testUtils.decodeCampaign(fixtureWithoutContractTags as never);
+
+    expect(decoded.tags).toEqual(["water", "rural"]);
+    expect(decoded.cover_image_url).toBe("https://example.com/cover.png");
+    expect(decoded.description).toBe("Real description");
+  });
+
   it("parseContractError maps Contract error strings", () => {
     expect(parseContractError(new Error("Error(Contract, #3)"))).toBe(
       "ContractErrors.CampaignNotActive",
@@ -338,6 +462,168 @@ describe("contractClient", () => {
     });
 
     await expect(module.getCampaignCount()).rejects.toThrow("fetch failed");
+  });
+
+  describe("paginated reads (no N-way fan-out)", () => {
+    type Call = { method?: string; args?: Array<{ u32?: () => number }> };
+
+    function methodsCalled(mockServer: { simulateTransaction: jest.Mock }): string[] {
+      return mockServer.simulateTransaction.mock.calls.map(
+        ([tx]: [{ ops?: Call[] }]) => tx.ops?.[0]?.method ?? "",
+      );
+    }
+
+    function pageOf(
+      scVal: ReturnType<typeof makeScValHelpers>,
+      fixture: unknown,
+      n: number,
+      next: number,
+    ) {
+      return {
+        result: {
+          retval: scVal.vec([scVal.vec(Array.from({ length: n }, () => fixture)), scVal.u32(next)]),
+        },
+      };
+    }
+
+    it("listCampaigns issues exactly one list_campaigns view per page", async () => {
+      const { module, mockServer } = await loadClient({ useMocks: false });
+
+      const page = await module.listCampaigns({ cursor: 1, limit: 20 });
+
+      expect(methodsCalled(mockServer)).toEqual(["list_campaigns"]);
+      expect(page.campaigns).toHaveLength(1);
+      // Short page => the listing is exhausted.
+      expect(page.nextCursor).toBeNull();
+    });
+
+    it("passes an exclusive id cursor and caps the limit at LIST_MAX_LIMIT", async () => {
+      const { module, mockServer } = await loadClient({ useMocks: false });
+
+      await module.listCampaigns({ cursor: 51, limit: 500 });
+
+      const [tx] = mockServer.simulateTransaction.mock.calls[0] as [{ ops?: Call[] }];
+      expect(tx.ops?.[0]?.args?.[0]?.u32?.()).toBe(50);
+      expect(tx.ops?.[0]?.args?.[1]?.u32?.()).toBe(50);
+    });
+
+    it("advances the cursor while pages are full", async () => {
+      const { module, mockServer, stellarSdkMock } = await loadClient({ useMocks: false });
+      const scVal = makeScValHelpers();
+      mockServer.simulateTransaction.mockImplementation(() =>
+        pageOf(scVal, stellarSdkMock.__campaignFixture, 2, 2),
+      );
+
+      const page = await module.listCampaigns({ cursor: 1, limit: 2 });
+
+      expect(page.nextCursor).toBe(3);
+    });
+
+    it("routes category and creator filters to the contract indexes", async () => {
+      const { module, mockServer } = await loadClient({ useMocks: false });
+
+      await module.listCampaigns({ category: Category.Educator, limit: 10 });
+      await module.listCampaigns({ creator: TEST_ADMIN, limit: 10 });
+
+      expect(methodsCalled(mockServer)).toEqual([
+        "get_campaigns_by_category",
+        "get_creator_campaigns",
+      ]);
+    });
+
+    it("loading N campaigns costs ceil(N / 50) calls, never N", async () => {
+      const { module, mockServer, stellarSdkMock } = await loadClient({ useMocks: false });
+      const scVal = makeScValHelpers();
+      const total = 120;
+      mockServer.simulateTransaction.mockImplementation((tx: { ops?: Call[] }) => {
+        const op = tx.ops?.[0];
+        const start = op?.args?.[0]?.u32?.() ?? 0;
+        const n = Math.min(50, total - start);
+        return pageOf(scVal, stellarSdkMock.__campaignFixture, n, start + n);
+      });
+
+      const all = await module.getAllCampaigns();
+
+      expect(all).toHaveLength(total);
+      const methods = methodsCalled(mockServer);
+      expect(methods).toHaveLength(Math.ceil(total / 50));
+      expect(new Set(methods)).toEqual(new Set(["list_campaigns"]));
+      expect(methods).not.toContain("get_campaign");
+    });
+
+    it("getPlatformStats reads counts from one get_platform_stats call", async () => {
+      const { module, mockServer } = await loadClient({ useMocks: false });
+      const scVal = makeScValHelpers();
+      mockServer.simulateTransaction.mockImplementation(() => ({
+        result: {
+          retval: scVal.map({
+            total_campaigns: scVal.u32(42),
+            active_campaigns: scVal.u32(30),
+            verified_campaigns: scVal.u32(20),
+            cancelled_campaigns: scVal.u32(2),
+            total_amount_raised: scVal.bigint(9_000_000_000),
+            stats_are_partial: scVal.bool(false),
+          }),
+        },
+      }));
+
+      const stats = await module.getPlatformStats();
+
+      expect(stats.totalCampaigns).toBe(42);
+      expect(stats.totalAmountRaised).toBe(BigInt(9_000_000_000));
+      expect(methodsCalled(mockServer)).toEqual(["get_platform_stats"]);
+    });
+  });
+
+  describe("on-chain bookmarks and creator revenue claim", () => {
+    it("reads saved campaigns and the count from the contract", async () => {
+      const { module, mockServer } = await loadClient({ useMocks: false });
+      const scVal = makeScValHelpers();
+      mockServer.simulateTransaction.mockImplementation(
+        (tx: { ops?: Array<{ method?: string }> }) => {
+          const method = tx.ops?.[0]?.method;
+          if (method === "get_saved_campaigns") {
+            return { result: { retval: scVal.vec([scVal.u32(3), scVal.u32(9)]) } };
+          }
+          if (method === "get_saved_campaigns_count") return { result: { retval: scVal.u32(2) } };
+          return { result: { retval: null } };
+        },
+      );
+
+      expect(await module.getSavedCampaigns(TEST_USER)).toEqual([3, 9]);
+      expect(await module.getSavedCampaignsCount(TEST_USER)).toBe(2);
+    });
+
+    it("mock mode enforces the bookmark limit and duplicate checks", async () => {
+      const { module } = await loadClient({ useMocks: true });
+
+      await module.saveCampaign(TEST_USER, 1);
+      await expect(module.saveCampaign(TEST_USER, 1)).rejects.toThrow(
+        "ContractErrors.CampaignAlreadyBookmarked",
+      );
+      await module.batchSaveCampaigns(TEST_USER, [2, 3, 4, 5, 6, 7, 8, 9, 10]);
+      expect(await module.getSavedCampaignsCount(TEST_USER)).toBe(module.MAX_BOOKMARKS_PER_WALLET);
+      await expect(module.saveCampaign(TEST_USER, 11)).rejects.toThrow(
+        "ContractErrors.BookmarkLimitReached",
+      );
+
+      await module.removeSavedCampaign(TEST_USER, 1);
+      expect(await module.getSavedCampaigns(TEST_USER)).not.toContain(1);
+      await module.clearSavedCampaigns(TEST_USER);
+      expect(await module.getSavedCampaigns(TEST_USER)).toEqual([]);
+    });
+
+    it("claimCreatorRevenue submits claim_creator_revenue for the campaign id", async () => {
+      const { module, mockServer } = await loadClient({ useMocks: false });
+
+      const txHash = await module.claimCreatorRevenue(7, TEST_ADMIN);
+
+      expect(txHash).toMatch(/^hash-/);
+      const methods = mockServer.simulateTransaction.mock.calls.map(
+        ([tx]: [{ ops?: Array<{ method?: string }> }]) => tx.ops?.[0]?.method,
+      );
+      expect(methods).toContain("claim_creator_revenue");
+    });
   });
 
   it("non-mock branch runs core read/write flows with mocked SDK", async () => {
@@ -387,5 +673,159 @@ describe("contractClient", () => {
     expect(await module.updateAdmin(TEST_NEW_ADMIN)).toMatch(/^hash-/);
     expect(await module.voteOnCampaign(1, TEST_USER, true)).toMatch(/^hash-/);
     expect(await module.verifyCampaignWithVotes(1)).toMatch(/^hash-/);
+  });
+
+  describe("RPC server lifecycle", () => {
+    it("reuses one server across successful calls", async () => {
+      const { module, serverUrls } = await loadClient({ useMocks: false });
+
+      await module.getAdmin();
+      await module.getPlatformFee();
+      await module.getCampaignCount();
+
+      expect(serverUrls).toEqual(["https://example-rpc.invalid"]);
+    });
+
+    it("reconnects on the next call after a transport failure", async () => {
+      const { module, mockServer, serverUrls } = await loadClient({ useMocks: false });
+
+      await module.getAdmin();
+      expect(serverUrls).toHaveLength(1);
+
+      const transportError = new TypeError("fetch failed");
+      transportError.cause = Object.assign(new Error("connect ECONNREFUSED"), {
+        code: "ECONNREFUSED",
+      });
+      mockServer.simulateTransaction.mockImplementationOnce(() => {
+        throw transportError;
+      });
+      module.clearContractCallCache();
+
+      // Transport failures reconnect and retry transparently.
+      await expect(module.getAdmin()).resolves.toBe(TEST_ADMIN);
+      expect(serverUrls).toHaveLength(2);
+    });
+
+    it("reconnects after a timeout", async () => {
+      const { module, mockServer, serverUrls } = await loadClient({ useMocks: false });
+
+      await module.getAdmin();
+      mockServer.simulateTransaction.mockImplementationOnce(() => {
+        throw new Error("Request timed out after 30000ms");
+      });
+      module.clearContractCallCache();
+
+      await expect(module.getAdmin()).resolves.toBe(TEST_ADMIN);
+      expect(serverUrls).toHaveLength(2);
+    });
+
+    it("keeps the server when the node returns an application error", async () => {
+      const { module, mockServer, serverUrls } = await loadClient({ useMocks: false });
+
+      await module.getAdmin();
+      mockServer.simulateTransaction.mockImplementationOnce(() => {
+        throw new Error("Error(Contract, #6)");
+      });
+      module.clearContractCallCache();
+
+      await expect(module.getAdmin()).rejects.toThrow();
+      await expect(module.getAdmin()).resolves.toBe(TEST_ADMIN);
+      expect(serverUrls).toHaveLength(1);
+    });
+
+    it("resetRpcServer() forces a reconnect", async () => {
+      const { module, serverUrls } = await loadClient({ useMocks: false });
+
+      await module.getAdmin();
+      expect(serverUrls).toHaveLength(1);
+
+      module.resetRpcServer();
+      module.clearContractCallCache();
+      await module.getAdmin();
+
+      expect(serverUrls).toHaveLength(2);
+    });
+  });
+
+  describe("RPC latency fallback", () => {
+    const PRIMARY = "https://example-rpc.invalid";
+    const FALLBACK = "https://fallback-rpc.invalid";
+
+    beforeEach(() => {
+      process.env.NEXT_PUBLIC_SOROBAN_RPC_FALLBACK_URL = FALLBACK;
+      process.env.NEXT_PUBLIC_RPC_LATENCY_THRESHOLD_MS = "50";
+      jest.spyOn(console, "warn").mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+      delete process.env.NEXT_PUBLIC_SOROBAN_RPC_FALLBACK_URL;
+      delete process.env.NEXT_PUBLIC_RPC_LATENCY_THRESHOLD_MS;
+      jest.restoreAllMocks();
+    });
+
+    function delayed<T>(value: T, ms: number): Promise<T> {
+      return new Promise((resolve) => setTimeout(() => resolve(value), ms));
+    }
+
+    it("retries on the fallback when the primary is slower than the threshold", async () => {
+      const { module, mockServer, serverUrls } = await loadClient({ useMocks: false });
+      const respond = mockServer.simulateTransaction.getMockImplementation()!;
+      mockServer.simulateTransaction.mockImplementationOnce((tx) => delayed(respond(tx), 200));
+
+      await expect(module.getAdmin()).resolves.toBe(TEST_ADMIN);
+
+      expect(serverUrls).toEqual([PRIMARY, FALLBACK]);
+      expect(module.getActiveRpcUrl()).toBe(FALLBACK);
+    });
+
+    it("keeps using the fallback for later calls without re-timing the primary", async () => {
+      const { module, mockServer, serverUrls } = await loadClient({ useMocks: false });
+      const respond = mockServer.simulateTransaction.getMockImplementation()!;
+      mockServer.simulateTransaction.mockImplementationOnce((tx) => delayed(respond(tx), 200));
+
+      await module.getAdmin();
+      await module.getPlatformFee();
+
+      expect(serverUrls).toEqual([PRIMARY, FALLBACK]);
+    });
+
+    it("switches immediately on a primary transport failure", async () => {
+      const { module, mockServer, serverUrls } = await loadClient({ useMocks: false });
+      mockServer.simulateTransaction.mockImplementationOnce(() => {
+        throw new TypeError("fetch failed");
+      });
+
+      const started = Date.now();
+      await expect(module.getAdmin()).resolves.toBe(TEST_ADMIN);
+
+      expect(Date.now() - started).toBeLessThan(400);
+      expect(serverUrls).toEqual([PRIMARY, FALLBACK]);
+    });
+
+    it("goes back to the primary once the retry window has passed", async () => {
+      const { module, mockServer, serverUrls } = await loadClient({ useMocks: false });
+      const respond = mockServer.simulateTransaction.getMockImplementation()!;
+      mockServer.simulateTransaction.mockImplementationOnce((tx) => delayed(respond(tx), 200));
+      await module.getAdmin();
+
+      const now = Date.now();
+      jest.spyOn(Date, "now").mockReturnValue(now + module.RPC_PRIMARY_RETRY_AFTER_MS + 1);
+      module.clearContractCallCache();
+      await module.getAdmin();
+
+      expect(module.getActiveRpcUrl()).toBe(PRIMARY);
+      expect(serverUrls).toEqual([PRIMARY, FALLBACK, PRIMARY]);
+    });
+
+    it("still surfaces contract errors as user-facing messages through the fallback", async () => {
+      const { module, mockServer } = await loadClient({ useMocks: false });
+      mockServer.simulateTransaction.mockImplementation(() => {
+        throw new Error("Error(Contract, #6)");
+      });
+
+      await expect(module.getAdmin()).rejects.toThrow(
+        parseContractError(new Error("Error(Contract, #6)")),
+      );
+    });
   });
 });
