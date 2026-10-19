@@ -1,10 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { Bookmark } from "lucide-react";
+import { Bookmark, FileText } from "lucide-react";
 import { notFound } from "next/navigation";
-import Image from "next/image";
-import { useState, useEffect } from "react";
+import LazyImage from "@/components/LazyImage";
+import { useState, useEffect, useCallback } from "react";
 import dynamic from "next/dynamic";
 import CampaignTabs from "@/components/CampaignTabs";
 const RevenueSharingPanel = dynamic(() => import("@/components/RevenueSharingPanel"), {
@@ -14,6 +14,10 @@ const VestingReservePanel = dynamic(() => import("@/components/VestingReservePan
   ssr: false,
 });
 const DonationModal = dynamic(() => import("@/components/DonationModal"), { ssr: false });
+const ExtendDeadlineModal = dynamic(
+  () => import("@/components/ExtendDeadline/ExtendDeadlineModal"),
+  { ssr: false },
+);
 import CampaignStatusBadge from "@/components/CampaignStatusBadge";
 import DeadlineCountdown from "@/components/DeadlineCountdown";
 import FundingProgressBar from "@/components/FundingProgressBar";
@@ -23,6 +27,9 @@ import ShareButtons from "@/components/ShareButtons";
 import SafeMarkdown from "@/components/SafeMarkdown";
 import ReportModal from "@/components/ReportModal";
 import CampaignActions from "@/components/CampaignActions";
+import ImpactMetricsCard from "@/components/ImpactMetricsCard";
+import PersonalCap from "@/components/PersonalCap";
+import DonationMilestones from "@/components/DonationMilestones";
 import AsyncButtonContent from "@/components/AsyncButtonContent";
 import { useToast } from "@/components/ToastProvider";
 import VotingComponent from "@/components/VotingComponent";
@@ -41,16 +48,22 @@ import {
   getContribution,
   claimRefund,
   cancelCampaign,
+  getAdmin,
+  getMilestones,
+  isMilestoneClaimed,
+  verifyMilestone,
+  claimMilestone,
 } from "@/lib/contractClient";
 import { useTranslations, useLocale } from "next-intl";
 import { CauseDetailSkeleton } from "@/components/Skeleton";
-import { Campaign, Vote, CATEGORY_LABELS } from "@/types";
+import { Campaign, Vote, CATEGORY_LABELS, ContractMilestone } from "@/types";
 import { stroopsToXlmNumber } from "@/lib/stellarAmount";
 import { parseContractError } from "@/utils/contractErrors";
 import { getAsyncActionErrorMessage, withActionTimeout } from "@/utils/asyncAction";
 import { trackViewCampaign } from "@/lib/analytics";
 import { formatXlm, formatDate } from "@/lib/formatters";
 import { getLocalizedDescription } from "@/utils/localizedDescription";
+import { isBlankMarkdown } from "@/utils/markdownContent";
 import { isSameAddress } from "@/lib/stellar";
 const EditCampaignMetadata = dynamic(() => import("@/components/EditCampaignMetadata"), {
   ssr: false,
@@ -59,6 +72,7 @@ const EditCampaignMetadata = dynamic(() => import("@/components/EditCampaignMeta
 export default function CauseDetailClient({ id }: { id: string }) {
   const { publicKey: userWalletAddress } = useWallet();
   const tContractErrors = useTranslations("ContractErrors");
+  const tCauseDetail = useTranslations("CauseDetail");
   const locale = useLocale();
   const {
     campaign: fetchedCampaign,
@@ -69,6 +83,7 @@ export default function CauseDetailClient({ id }: { id: string }) {
   const { platformFeeBps, isLoading: isPlatformFeeLoading, isFallback } = usePlatformFee();
 
   const [campaign, setCampaign] = useState<Campaign | null>(null);
+  const [isEditFormDirty, setIsEditFormDirty] = useState(false);
   const [userVote, setUserVote] = useState<Vote | undefined>(undefined);
   const [isVoting, setIsVoting] = useState(false);
   const {
@@ -80,8 +95,16 @@ export default function CauseDetailClient({ id }: { id: string }) {
     enabled: Number(id) > 0,
   });
   const [isDonationModalOpen, setIsDonationModalOpen] = useState(false);
+  const [isExtendModalOpen, setIsExtendModalOpen] = useState(false);
   const [isReportModalOpen, setIsReportModalOpen] = useState(false);
   const [isDescriptionExpanded, setIsDescriptionExpanded] = useState(false);
+  const [milestonePayoutPlan, setMilestonePayoutPlan] = useState<{
+    milestones: ContractMilestone[];
+    claimed: Record<number, boolean>;
+  } | null>(null);
+  const [isPlatformAdmin, setIsPlatformAdmin] = useState(false);
+  const [isVerifyingMilestoneId, setIsVerifyingMilestoneId] = useState<number | null>(null);
+  const [isClaimingMilestoneId, setIsClaimingMilestoneId] = useState<number | null>(null);
   const { showError, showSuccess, showWarning } = useToast();
   const { isSaved, toggleSaved } = useSavedCampaigns();
   const { isFollowing, toggleFollow } = useFollowedCreators();
@@ -110,6 +133,84 @@ export default function CauseDetailClient({ id }: { id: string }) {
       trackViewCampaign(campaign.id);
     }
   }, [campaign]);
+
+  // Determine whether the connected wallet is the platform admin (issue #1672)
+  useEffect(() => {
+    if (!userWalletAddress || isPlatformAdmin) return;
+    let isMounted = true;
+    getAdmin()
+      .then((adminAddress) => {
+        if (isMounted && adminAddress) {
+          setIsPlatformAdmin(isSameAddress(adminAddress, userWalletAddress));
+        }
+      })
+      .catch(() => {
+        // ignore: admin check is best-effort gating for the verify action
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, [userWalletAddress, isPlatformAdmin]);
+
+  const reloadMilestonePlan = useCallback(async () => {
+    if (!campaign) {
+      setMilestonePayoutPlan(null);
+      return;
+    }
+    try {
+      const milestones = await getMilestones(campaign.id);
+      if (milestones.length === 0) {
+        setMilestonePayoutPlan(null);
+        return;
+      }
+      const claimedFlags = await Promise.all(
+        milestones.map((m) => isMilestoneClaimed(campaign.id, m.id).catch(() => false)),
+      );
+      setMilestonePayoutPlan({
+        milestones,
+        claimed: Object.fromEntries(milestones.map((m, i) => [m.id, claimedFlags[i]])),
+      });
+    } catch {
+      setMilestonePayoutPlan(null);
+    }
+  }, [campaign?.id]);
+
+  // Load the on-chain milestone payout plan and claimed flags (issue #1672)
+  useEffect(() => {
+    void reloadMilestonePlan();
+  }, [reloadMilestonePlan]);
+
+  // Warn the user before leaving while the campaign edit form has unsaved changes.
+  useEffect(() => {
+    if (!isEditFormDirty) return;
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+
+    const handleDocumentClick = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      const anchor = (e.target as Element).closest("a");
+      if (!anchor) return;
+
+      const href = anchor.getAttribute("href");
+      if (!href || href.startsWith("#") || anchor.target === "_blank") return;
+
+      if (!window.confirm("You have unsaved changes. Are you sure you want to leave?")) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    document.addEventListener("click", handleDocumentClick, true);
+
+    return () => {
+      window.removeEventListener("beforeunload", handleBeforeUnload);
+      document.removeEventListener("click", handleDocumentClick, true);
+    };
+  }, [isEditFormDirty]);
 
   // Load quorum config whenever campaign is available
   useEffect(() => {
@@ -150,6 +251,35 @@ export default function CauseDetailClient({ id }: { id: string }) {
     };
     check();
   }, [userWalletAddress, campaign]);
+
+  const handleVerifyMilestone = async (milestoneId: number) => {
+    if (!campaign) return;
+    setIsVerifyingMilestoneId(milestoneId);
+    try {
+      await withActionTimeout(verifyMilestone(campaign.id, milestoneId));
+      showSuccess(`Milestone ${milestoneId} verified — the creator can now claim its payout.`);
+      await reloadMilestonePlan();
+    } catch (error) {
+      showError(getAsyncActionErrorMessage(error, parseContractError));
+    } finally {
+      setIsVerifyingMilestoneId(null);
+    }
+  };
+
+  const handleClaimMilestone = async (milestoneId: number) => {
+    if (!campaign) return;
+    setIsClaimingMilestoneId(milestoneId);
+    try {
+      await withActionTimeout(claimMilestone(campaign.id, milestoneId));
+      showSuccess(`Milestone ${milestoneId} payout claimed successfully.`);
+      await reloadMilestonePlan();
+      refetch();
+    } catch (error) {
+      showError(getAsyncActionErrorMessage(error, parseContractError));
+    } finally {
+      setIsClaimingMilestoneId(null);
+    }
+  };
 
   // Load refundable contribution
   useEffect(() => {
@@ -252,7 +382,7 @@ export default function CauseDetailClient({ id }: { id: string }) {
 
   if (error) {
     return (
-      <div className="min-h-screen bg-linear-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-800">
+      <div className="min-h-full bg-linear-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-800">
         <main className="container mx-auto px-4 py-24 text-center">
           <h1 className="text-3xl font-bold text-zinc-900 dark:text-zinc-50 mb-4">
             Failed to load cause
@@ -287,6 +417,7 @@ export default function CauseDetailClient({ id }: { id: string }) {
   const voteBreakdownApprovePct = voteCounts.totalVotes > 0 ? approvalRate : 50;
   const voteBreakdownRejectPct = 100 - voteBreakdownApprovePct;
   const categoryLabel = CATEGORY_LABELS[campaign.category] ?? "Other";
+  const localizedDescription = getLocalizedDescription(campaign.description, locale);
   const platformFeePercent = platformFeeBps / 100;
   const estimatedFeeAmount = raised * (platformFeeBps / 10000);
   const estimatedCreatorReceives = raised - estimatedFeeAmount;
@@ -299,15 +430,27 @@ export default function CauseDetailClient({ id }: { id: string }) {
   const refundableXlm = stroopsToXlmNumber(refundableAmount) || 0;
 
   return (
-    <div className="min-h-screen bg-linear-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-800">
+    <div className="min-h-full bg-linear-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-800">
       <main className="container mx-auto px-4 py-8 max-w-5xl">
+        <button
+          onClick={() => setIsDonationModalOpen(true)}
+          className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 md:hidden bg-blue-600 text-white px-6 py-3 rounded-full font-medium shadow-lg"
+        >
+          Donate
+        </button>
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
           <nav className="text-sm text-zinc-500 dark:text-zinc-400 flex items-center gap-2">
             <Link
               href="/causes"
+              onClick={(e) => {
+                if (typeof window !== "undefined" && window.history.length > 1) {
+                  e.preventDefault();
+                  window.history.back();
+                }
+              }}
               className="hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
             >
-              Causes
+              ← Causes
             </Link>
             <span>›</span>
             <span className="text-zinc-900 dark:text-zinc-50 truncate max-w-xs">
@@ -327,13 +470,10 @@ export default function CauseDetailClient({ id }: { id: string }) {
               </div>
               {campaign.cover_image_url && (
                 <div className="relative w-full aspect-video rounded-lg overflow-hidden mb-4 bg-zinc-100 dark:bg-zinc-700">
-                  <Image
+                  <LazyImage
                     src={campaign.cover_image_url}
                     alt={campaign.title}
-                    fill
-                    unoptimized
-                    loading="lazy"
-                    className="object-cover"
+                    className="absolute inset-0 w-full h-full object-cover"
                   />
                 </div>
               )}
@@ -341,30 +481,43 @@ export default function CauseDetailClient({ id }: { id: string }) {
                 {campaign.title}
               </h1>
               <div className="relative">
-                <div
-                  className={`overflow-hidden transition-all duration-300 ${!isDescriptionExpanded ? "max-h-[250px] relative" : ""}`}
-                >
-                  <SafeMarkdown className="prose prose-zinc dark:prose-invert max-w-none break-words">
-                    {getLocalizedDescription(campaign.description, locale)}
-                  </SafeMarkdown>
-                  {!isDescriptionExpanded && (
-                    <div className="absolute bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-white dark:from-zinc-800 to-transparent pointer-events-none" />
-                  )}
-                </div>
-                {campaign.description &&
-                  getLocalizedDescription(campaign.description, locale).length > 500 && (
-                    <div className="mt-2 text-center">
-                      <button
-                        type="button"
-                        onClick={() => setIsDescriptionExpanded(!isDescriptionExpanded)}
-                        className="text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline focus:outline-none focus:ring-2 focus:ring-blue-500 rounded px-3 py-1 transition-colors"
-                        aria-expanded={isDescriptionExpanded}
-                        aria-controls="campaign-description"
-                      >
-                        {isDescriptionExpanded ? "Show less" : "Read more"}
-                      </button>
+                {isBlankMarkdown(localizedDescription) ? (
+                  <div
+                    id="campaign-description"
+                    className="flex items-center gap-3 rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/40 px-4 py-6 text-sm text-zinc-500 dark:text-zinc-400"
+                    role="status"
+                  >
+                    <FileText size={18} className="shrink-0 opacity-70" aria-hidden="true" />
+                    <span>{tCauseDetail("noDescription")}</span>
+                  </div>
+                ) : (
+                  <>
+                    <div
+                      id="campaign-description"
+                      className={`overflow-hidden transition-all duration-300 ${!isDescriptionExpanded ? "max-h-[250px] relative" : ""}`}
+                    >
+                      <SafeMarkdown className="prose prose-zinc dark:prose-invert max-w-none break-words">
+                        {localizedDescription}
+                      </SafeMarkdown>
+                      {!isDescriptionExpanded && (
+                        <div className="absolute bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-white dark:from-zinc-800 to-transparent pointer-events-none" />
+                      )}
                     </div>
-                  )}
+                    {localizedDescription.length > 500 && (
+                      <div className="mt-2 text-center">
+                        <button
+                          type="button"
+                          onClick={() => setIsDescriptionExpanded(!isDescriptionExpanded)}
+                          className="text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 hover:underline focus:outline-none focus:ring-2 focus:ring-blue-500 rounded px-3 py-1 transition-colors"
+                          aria-expanded={isDescriptionExpanded}
+                          aria-controls="campaign-description"
+                        >
+                          {isDescriptionExpanded ? "Show less" : "Read more"}
+                        </button>
+                      </div>
+                    )}
+                  </>
+                )}
               </div>
 
               {canEdit && (
@@ -373,7 +526,22 @@ export default function CauseDetailClient({ id }: { id: string }) {
                   initialTitle={campaign.title}
                   initialDescription={campaign.description}
                   initialCoverImageUrl={campaign.cover_image_url ?? ""}
+                  onDirtyChange={setIsEditFormDirty}
                 />
+              )}
+              {isCreator && !campaign.is_cancelled && (
+                <button
+                  onClick={() => setIsExtendModalOpen(true)}
+                  style={{
+                    marginTop: 12,
+                    padding: "8px 12px",
+                    borderRadius: 8,
+                    border: "1px solid var(--border)",
+                    background: "var(--surface)",
+                  }}
+                >
+                  Extend Deadline
+                </button>
               )}
 
               {/* Share + Report toolbar */}
@@ -475,6 +643,29 @@ export default function CauseDetailClient({ id }: { id: string }) {
                 />
               </div>
             )}
+
+            <div className="bg-white dark:bg-zinc-800 rounded-xl border border-zinc-200 dark:border-zinc-700 p-4 sm:p-6">
+              <DonationMilestones
+                amountRaised={campaign.amount_raised}
+                onChainPlan={
+                  milestonePayoutPlan
+                    ? {
+                        milestones: milestonePayoutPlan.milestones,
+                        claimed: milestonePayoutPlan.claimed,
+                        isAdmin: isPlatformAdmin,
+                        isCreator: isCreator,
+                        isFundingGoalMet: campaign.amount_raised >= campaign.funding_goal,
+                        isWithdrawn: campaign.funds_withdrawn,
+                        platformFeeBps: platformFeeBps,
+                        onVerify: handleVerifyMilestone,
+                        onClaim: handleClaimMilestone,
+                        isVerifyingId: isVerifyingMilestoneId,
+                        isClaimingId: isClaimingMilestoneId,
+                      }
+                    : null
+                }
+              />
+            </div>
 
             <div className="bg-white dark:bg-zinc-800 rounded-xl shadow-sm border border-zinc-200 dark:border-zinc-700 p-6">
               <div className="flex items-center justify-between gap-4">
@@ -605,9 +796,13 @@ export default function CauseDetailClient({ id }: { id: string }) {
               </div>
             )}
 
+            <ImpactMetricsCard campaign={campaign} />
+
             <CampaignActions campaign={campaign} onActionSuccess={refetch} />
 
             <VestingReservePanel campaign={campaign} onActionSuccess={refetch} />
+
+            <PersonalCap campaignId={campaign.id} />
 
             <div className="bg-white dark:bg-zinc-800 rounded-xl shadow-sm border border-zinc-200 dark:border-zinc-700 p-5">
               <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50 mb-3">
@@ -699,6 +894,14 @@ export default function CauseDetailClient({ id }: { id: string }) {
         />
       </main>
 
+      {isExtendModalOpen && (
+        <ExtendDeadlineModal
+          campaignId={campaign.id}
+          currentDeadline={campaign.deadline}
+          onClose={() => setIsExtendModalOpen(false)}
+          onSuccess={() => window.location.reload()}
+        />
+      )}
       {isDonationModalOpen && (
         <DonationModal
           campaign={campaign}

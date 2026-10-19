@@ -2,12 +2,14 @@
 
 import { useState, useEffect } from "react";
 import { useTranslations } from "next-intl";
+import Modal from "./ui/Modal";
 
 interface Props {
   campaignId: number;
   initialTitle: string;
   initialDescription: string;
   initialCoverImageUrl: string;
+  onDirtyChange?: (isDirty: boolean) => void;
 }
 
 interface MetaOverride {
@@ -17,20 +19,32 @@ interface MetaOverride {
   editedAt: string;
 }
 
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 export default function EditCampaignMetadata({
   campaignId,
   initialTitle,
   initialDescription,
   initialCoverImageUrl,
+  onDirtyChange,
 }: Props) {
   const t = useTranslations("EditCampaignMetadata");
   const storageKey = `poh_meta_override_${campaignId}`;
 
   const [open, setOpen] = useState(false);
+  const [confirmClose, setConfirmClose] = useState(false);
   const [title, setTitle] = useState(initialTitle);
   const [description, setDescription] = useState(initialDescription);
   const [coverImageUrl, setCoverImageUrl] = useState(initialCoverImageUrl);
   const [override, setOverride] = useState<MetaOverride | null>(null);
+  const [coverImageError, setCoverImageError] = useState<string | null>(null);
 
   useEffect(() => {
     try {
@@ -48,10 +62,17 @@ export default function EditCampaignMetadata({
   }, [storageKey]);
 
   const handleSave = () => {
+    const cover = coverImageUrl.trim();
+    if (cover !== "" && !isValidHttpUrl(cover)) {
+      setCoverImageError(t("coverImageUrlInvalid"));
+      return;
+    }
+
+    setCoverImageError(null);
     const data: MetaOverride = {
       title,
       description,
-      coverImageUrl,
+      coverImageUrl: cover,
       editedAt: new Date().toISOString(),
     };
     try {
@@ -74,13 +95,41 @@ export default function EditCampaignMetadata({
     setCoverImageUrl(initialCoverImageUrl);
   };
 
+  const savedTitle = override?.title ?? initialTitle;
+  const savedDescription = override?.description ?? initialDescription;
+  const savedCoverImageUrl = override?.coverImageUrl ?? initialCoverImageUrl;
+  const isDirty =
+    title !== savedTitle ||
+    description !== savedDescription ||
+    coverImageUrl !== savedCoverImageUrl;
+
+  useEffect(() => {
+    if (onDirtyChange) onDirtyChange(isDirty);
+  }, [isDirty, onDirtyChange]);
+
+  const handleToggle = () => {
+    if (open && isDirty) {
+      setConfirmClose(true);
+    } else {
+      setOpen((v) => !v);
+    }
+  };
+
+  const handleDiscard = () => {
+    setConfirmClose(false);
+    setOpen(false);
+    setTitle(savedTitle);
+    setDescription(savedDescription);
+    setCoverImageUrl(savedCoverImageUrl);
+  };
+
   return (
     <div className="mt-4 rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/50">
       {/* Toggle header */}
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-700/50 rounded-xl transition-colors"
+        onClick={handleToggle}
+        className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium texr-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-700/50 rounded-xl transition-colors"
         aria-expanded={open}
       >
         <span className="flex items-center gap-2">
@@ -96,7 +145,7 @@ export default function EditCampaignMetadata({
             strokeLinejoin="round"
             aria-hidden="true"
           >
-            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+            <path d="M11 4H4A2 2 0 0 0 2 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
             <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
           </svg>
           {t("editMetadata")}
@@ -116,7 +165,7 @@ export default function EditCampaignMetadata({
       </button>
 
       {open && (
-        <div className="px-4 pb-4 flex flex-col gap-4">
+        <div data-testid="edit-metadata-panel" className="px-4 pb-4 flex flex-col gap-4">
           <p className="text-xs text-zinc-500 dark:text-zinc-400 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 px-3 py-2">
             {t("note")}
           </p>
@@ -168,9 +217,23 @@ export default function EditCampaignMetadata({
               id={`edit-meta-cover-${campaignId}`}
               type="url"
               value={coverImageUrl}
-              onChange={(e) => setCoverImageUrl(e.target.value)}
+              onChange={(e) => {
+                setCoverImageUrl(e.target.value);
+                setCoverImageError(null);
+              }}
+              aria-invalid={coverImageError ? true : undefined}
+              aria-describedby={coverImageError ? `edit-meta-cover-error-${campaignId}` : undefined}
               className="w-full px-3 py-2 rounded-lg border border-zinc-200 dark:border-zinc-600 bg-white dark:bg-zinc-700 text-sm text-zinc-900 dark:text-zinc-50 focus:outline-none focus:ring-2 focus:ring-blue-500"
             />
+            {coverImageError && (
+              <p
+                id={`edit-meta-cover-error-${campaignId}`}
+                role="alert"
+                className="mt-1 text-xs text-red-600 dark:text-red-400"
+              >
+                {coverImageError}
+              </p>
+            )}
           </div>
 
           <button
@@ -200,6 +263,43 @@ export default function EditCampaignMetadata({
             </div>
           )}
         </div>
+      )}
+
+      {confirmClose && (
+        <Modal
+          isOpen={confirmClose}
+          onClose={() => setConfirmClose(false)}
+          role="alertdialog"
+          ariaLabelledBy="confirm-close-title"
+        >
+          <div className="p-6">
+            <h2
+              id="confirm-close-title"
+              className="text-lg font-semibold text-zinc-900 dark:text-zinc-50"
+            >
+              Unsaved changes
+            </h2>
+            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
+              Your changes will be lost if you close the editor.
+            </p>
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setConfirmClose(false)}
+                className="px-4 py-2 rounded-lg border border-zinc-300 dark:border-zinc-600 text-sm font-medium text-zinc-700 dark:text-zinc-300 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+              >
+                Keep editing
+              </button>
+              <button
+                type="button"
+                onClick={handleDiscard}
+                className="px-4 py-2 rounded-lg bg-red-600 text-white text-sm font-medium hover:bg-red-700 transition-colors"
+              >
+                Discard
+              </button>
+            </div>
+          </div>
+        </Modal>
       )}
     </div>
   );

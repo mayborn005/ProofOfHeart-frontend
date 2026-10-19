@@ -4,10 +4,12 @@ import DonationModal from "@/components/DonationModal";
 import { Category, type Campaign } from "@/types";
 
 const mockGetCampaign = jest.fn();
+const mockEstimateNetworkFee = jest.fn();
 
 jest.mock("@/lib/contractClient", () => ({
   contribute: jest.fn(),
-  getCampaign: (...args: any[]) => mockGetCampaign(...args),
+  getCampaign: (...args: unknown[]) => mockGetCampaign(...args),
+  estimateContributeNetworkFee: (...args: unknown[]) => mockEstimateNetworkFee(...args),
 }));
 
 jest.mock("@/components/ToastProvider", () => ({
@@ -118,6 +120,27 @@ describe("DonationModal", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetCampaign.mockImplementation((id) => Promise.resolve(makeCampaign({ id })));
+    mockEstimateNetworkFee.mockResolvedValue(100_000n);
+  });
+
+  it("selects a quick XLM amount and exposes the same amount for submission", () => {
+    render(<DonationModal {...defaultProps} />);
+    const preset = screen.getByRole("button", { name: "10 XLM" });
+    fireEvent.click(preset);
+    expect(screen.getByLabelText("Amount (XLM)")).toHaveValue(10);
+    expect(preset).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "Donate 10 XLM" })).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("Amount (XLM)"), { target: { value: "12" } });
+    expect(preset).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("disables presets that exceed the remaining goal", () => {
+    render(
+      <DonationModal {...defaultProps} campaign={makeCampaign({ amount_raised: 950_000_000n })} />,
+    );
+    expect(screen.getByRole("button", { name: "5 XLM" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "10 XLM" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "25 XLM" })).toBeDisabled();
   });
 
   it("rejects zero amounts by disabling submit", () => {
@@ -155,6 +178,30 @@ describe("DonationModal", () => {
     expect(input).toHaveAttribute("aria-describedby", "donation-amount-error");
   });
 
+  it("gives the donation amount input an explicit aria-label", () => {
+    render(<DonationModal {...defaultProps} />);
+
+    const input = screen.getByLabelText("Amount (XLM)");
+
+    expect(input).toHaveAttribute("aria-label", "Amount (XLM)");
+  });
+
+  it("announces modal funding progress to assistive technology", () => {
+    render(<DonationModal {...defaultProps} />);
+
+    const progressbar = screen.getByRole("progressbar", { name: "1% funded" });
+
+    expect(progressbar).toHaveAttribute("aria-valuenow", "1");
+    expect(progressbar).toHaveAttribute("aria-valuemin", "0");
+    expect(progressbar).toHaveAttribute("aria-valuemax", "100");
+    expect(progressbar.getAttribute("aria-valuetext")).toContain("1% funded");
+    expect(progressbar.getAttribute("aria-valuetext")).toContain("XLM");
+
+    const liveRegion = document.querySelector('[aria-live="polite"]');
+    expect(liveRegion).toHaveAttribute("aria-atomic", "true");
+    expect(liveRegion).toHaveTextContent("1% funded");
+  });
+
   it.each([
     ["1e5", "Scientific notation is not allowed."],
     ["-5", "Amount must be greater than zero."],
@@ -185,6 +232,18 @@ describe("DonationModal", () => {
     expect(screen.getByText("Est. network fee")).toBeInTheDocument();
     expect(screen.getByText("Total from your wallet")).toBeInTheDocument();
     expect(screen.getByText(/10\.01\s*XLM/)).toBeInTheDocument();
+  });
+
+  it("updates the displayed fee from operation simulation", async () => {
+    mockEstimateNetworkFee.mockResolvedValue(250_000n);
+    render(<DonationModal {...defaultProps} />);
+
+    fireEvent.change(screen.getByLabelText("Amount (XLM)"), { target: { value: "10" } });
+
+    await waitFor(() =>
+      expect(mockEstimateNetworkFee).toHaveBeenCalledWith(1, CONTRIBUTOR, 100_000_000n),
+    );
+    expect(screen.getByText(/10\.025\s*XLM/)).toBeInTheDocument();
   });
 
   it("calls contribute with amount converted to stroops", async () => {

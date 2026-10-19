@@ -1,9 +1,9 @@
 "use client";
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, memo, useRef } from "react";
 import { useTranslations, useLocale } from "next-intl";
 import Modal from "./ui/Modal";
-import { contribute, getCampaign } from "../lib/contractClient";
+import { contribute, estimateContributeNetworkFee, getCampaign } from "../lib/contractClient";
 import { getEstimatedContributeNetworkFeeXlm } from "../lib/networkFee";
 import { Campaign, basisPointsToPercentage } from "../types";
 import { xlmToStroops, stroopsToXlmNumber } from "@/lib/stellarAmount";
@@ -47,19 +47,16 @@ type DonationValidationKey =
   | "amountExceedsRemainingGoal"
   | "campaignAlreadyFunded";
 
-export default function DonationModal({
-  campaign,
-  onClose,
-  onSuccess,
-  onRefetch,
-}: DonationModalProps) {
+function DonationModal({ campaign, onClose, onSuccess, onRefetch }: DonationModalProps) {
   const t = useTranslations("Donation");
   const tModal = useTranslations("DonationModal");
   const tContractErrors = useTranslations("ContractErrors");
   const { publicKey } = useWallet();
   const { showError } = useToast();
   const { platformFeeBps } = usePlatformFee();
-  const estimatedNetworkFeeXlm = useMemo(() => getEstimatedContributeNetworkFeeXlm(), []);
+  const [estimatedNetworkFeeXlm, setEstimatedNetworkFeeXlm] = useState(
+    getEstimatedContributeNetworkFeeXlm,
+  );
 
   const [amount, setAmount] = useState("");
   const [step, setStep] = useState<Step>("input");
@@ -68,6 +65,14 @@ export default function DonationModal({
   const [isRecurring, setIsRecurring] = useState(false);
   const [recurringInterval, setRecurringInterval] = useState<RecurringInterval>("monthly");
   const [txPhase, setTxPhase] = useState<TransactionLifecyclePhase | null>(null);
+
+  const amountInputRef = useRef<HTMLInputElement>(null);
+  const statusRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (step === "input") amountInputRef.current?.focus();
+    else statusRef.current?.focus();
+  }, [step]);
 
   const [liveCampaign, setLiveCampaign] = useState<Campaign>(campaign);
 
@@ -181,8 +186,41 @@ export default function DonationModal({
   const newRaised = raised + amountNum;
   const newPct = goal > 0 ? Math.min(100, Math.round((newRaised / goal) * 100)) : 0;
   const currentPct = goal > 0 ? Math.min(100, Math.round((raised / goal) * 100)) : 0;
+  const displayedPct = step === "confirmed" ? newPct : currentPct;
+  const displayRaised = formatAmount(liveCampaign.amount_raised, locale, {
+    maximumFractionDigits: 2,
+  });
+  const displayGoal = formatAmount(liveCampaign.funding_goal, locale, { maximumFractionDigits: 2 });
+  const fundingProgressText = `${t("percentFunded", {
+    percent: displayedPct,
+  })}, ${displayRaised} / ${displayGoal} XLM`;
   const totalWalletCost =
     amountNum > 0 ? amountNum + estimatedNetworkFeeXlm : estimatedNetworkFeeXlm;
+
+  useEffect(() => {
+    if (!publicKey || !validation.valid || !amount.trim()) return;
+
+    let active = true;
+    const timeout = window.setTimeout(async () => {
+      try {
+        const fee = await estimateContributeNetworkFee(
+          campaign.id,
+          publicKey,
+          xlmToStroops(amount),
+        );
+        if (active) setEstimatedNetworkFeeXlm(stroopsToXlmNumber(fee));
+      } catch {
+        // Keep the documented conservative fallback if RPC estimation is
+        // temporarily unavailable. Submission performs its own simulation.
+        if (active) setEstimatedNetworkFeeXlm(getEstimatedContributeNetworkFeeXlm());
+      }
+    }, 300);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timeout);
+    };
+  }, [amount, campaign.id, publicKey, validation.valid]);
 
   const handleDonate = async () => {
     if (!publicKey) return;
@@ -261,8 +299,15 @@ export default function DonationModal({
       closeOnEscape={step !== "pending"}
       closeOnOverlayClick={step !== "pending"}
       ariaLabelledBy="donation-modal-title"
+      initialFocusRef={amountInputRef}
+      className="contribution-sheet"
+      overlayClassName="contribution-overlay"
     >
-      <div className="flex items-center justify-between px-6 py-4 border-b border-zinc-200 dark:border-zinc-700">
+      <div
+        aria-hidden="true"
+        className="mx-auto mt-3 h-1 w-10 shrink-0 rounded-full bg-zinc-300 sm:hidden dark:bg-zinc-600"
+      />
+      <div className="flex shrink-0 items-center justify-between gap-3 border-b border-zinc-200 px-4 py-3 sm:px-6 dark:border-zinc-700">
         <h2
           id="donation-modal-title"
           className="text-lg font-semibold text-zinc-900 dark:text-zinc-50"
@@ -273,30 +318,44 @@ export default function DonationModal({
           <button
             onClick={onClose}
             aria-label={t("closeAriaLabel")}
-            className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200 transition-colors text-2xl leading-none"
+            className="tap-target focus-ring flex w-11 shrink-0 items-center justify-center rounded-control text-2xl leading-none text-zinc-600 transition-colors duration-[140ms] hover:bg-zinc-100 motion-reduce:transition-none dark:text-zinc-300 dark:hover:bg-zinc-800"
           >
             ×
           </button>
         )}
       </div>
 
-      <div className="px-6 py-5 space-y-5">
+      <div
+        key={step}
+        className="contribution-content min-h-0 space-y-5 overflow-y-auto overscroll-contain px-4 py-5 sm:px-6"
+      >
         <p className="text-sm text-zinc-500 dark:text-zinc-400 line-clamp-2">{campaign.title}</p>
 
         <div>
           <div className="flex justify-between text-xs text-zinc-500 dark:text-zinc-400 mb-1">
-            <span>{t("percentFunded", { percent: currentPct })}</span>
+            <span>{t("percentFunded", { percent: displayedPct })}</span>
             <span>
-              {formatAmount(liveCampaign.amount_raised, locale, { maximumFractionDigits: 2 })} /{" "}
-              {formatAmount(liveCampaign.funding_goal, locale, { maximumFractionDigits: 2 })} XLM
+              {displayRaised} / {displayGoal} XLM
             </span>
           </div>
-          <div className="w-full bg-zinc-200 dark:bg-zinc-700 rounded-full h-2">
+          <div
+            role="progressbar"
+            aria-label={t("percentFunded", { percent: displayedPct })}
+            aria-valuenow={displayedPct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuetext={fundingProgressText}
+            className="w-full bg-zinc-200 dark:bg-zinc-700 rounded-full h-2"
+          >
             <div
-              className="bg-linear-to-r from-blue-500 to-purple-500 h-2 rounded-full transition-all duration-500"
-              style={{ width: `${step === "confirmed" ? newPct : currentPct}%` }}
+              aria-hidden="true"
+              className="bg-linear-to-r from-blue-500 to-purple-500 h-2 rounded-full transition-[width] duration-[140ms] motion-reduce:transition-none"
+              style={{ width: `${displayedPct}%` }}
             />
           </div>
+          <span className="sr-only" aria-live="polite" aria-atomic="true">
+            {fundingProgressText}
+          </span>
         </div>
 
         {step === "input" && (
@@ -310,19 +369,32 @@ export default function DonationModal({
               </label>
               <div className="relative">
                 <input
+                  ref={amountInputRef}
                   id="donation-amount"
                   type="number"
                   min="0.0000001"
                   step="any"
+                  inputMode="decimal"
+                  enterKeyHint="done"
                   value={amount}
+                  aria-label={t("amountLabel")}
                   aria-describedby={amountError ? "donation-amount-error" : undefined}
                   aria-invalid={amountError ? "true" : "false"}
                   disabled={isFullyFunded}
                   onChange={(e) => {
+                    // Feed the raw value to validateAmount so invalid input maps
+                    // to its specific i18n error key (scientific notation,
+                    // negatives, malformed decimals) instead of being silently
+                    // coerced into a valid-looking amount.
                     setAmount(e.target.value);
                     setError(null);
                     if (e.target.value && parseFloat(e.target.value) > 0) {
                       trackEnterAmount(campaign.id);
+                    }
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.currentTarget.blur();
                     }
                   }}
                   placeholder={t("amountPlaceholder")}
@@ -332,6 +404,33 @@ export default function DonationModal({
                   XLM
                 </span>
               </div>
+
+              <fieldset className="mt-3">
+                <legend className="mb-2 text-xs font-medium text-zinc-600 dark:text-zinc-300">
+                  {t("quickAmounts")}
+                </legend>
+                <div className="flex flex-wrap gap-2">
+                  {[5, 10, 25, 50].map((preset) => (
+                    <button
+                      key={preset}
+                      type="button"
+                      disabled={
+                        BigInt(preset) * 10_000_000n >
+                        liveCampaign.funding_goal - liveCampaign.amount_raised
+                      }
+                      aria-pressed={amount === String(preset)}
+                      onClick={() => {
+                        setAmount(String(preset));
+                        setError(null);
+                        trackEnterAmount(campaign.id);
+                      }}
+                      className={`tap-target focus-ring min-w-12 flex-1 rounded-control border px-3 py-2 text-sm font-semibold transition-colors duration-[140ms] disabled:cursor-not-allowed disabled:opacity-40 motion-reduce:transition-none ${amount === String(preset) ? "border-brand bg-brand-subtle text-brand dark:bg-blue-950 dark:text-blue-200" : "border-zinc-300 text-zinc-700 hover:bg-brand/5 dark:border-zinc-600 dark:text-zinc-200"}`}
+                    >
+                      {preset} XLM
+                    </button>
+                  ))}
+                </div>
+              </fieldset>
               {amountError && (
                 <p id="donation-amount-error" role="alert" className="mt-1 text-xs text-red-500">
                   {formatError(amountError)}
@@ -380,8 +479,11 @@ export default function DonationModal({
 
             {/* Recurring donation opt-in (#671) */}
             <div className="rounded-xl border border-zinc-200 dark:border-zinc-700 px-4 py-3 space-y-3">
-              <label className="flex items-start gap-3 cursor-pointer">
+              {/* The associated checkbox and visible text are nested in this label. */}
+              {/* eslint-disable-next-line jsx-a11y/label-has-associated-control */}
+              <label htmlFor="recurring-donation" className="flex items-start gap-3 cursor-pointer">
                 <input
+                  id="recurring-donation"
                   type="checkbox"
                   checked={isRecurring}
                   onChange={(e) => setIsRecurring(e.target.checked)}
@@ -421,48 +523,12 @@ export default function DonationModal({
                 </div>
               )}
             </div>
-            {amountNum > 0 && (
-              <dl className="rounded-xl border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-zinc-800/50 px-4 py-3 text-sm space-y-2">
-                <div className="flex justify-between gap-4">
-                  <dt className="text-zinc-600 dark:text-zinc-400">{t("contributionLine")}</dt>
-                  <dd className="font-medium text-zinc-900 dark:text-zinc-50 tabular-nums">
-                    {amountNum.toLocaleString(undefined, { maximumFractionDigits: 7 })} XLM
-                  </dd>
-                </div>
-                <div className="flex justify-between gap-4">
-                  <dt className="text-zinc-600 dark:text-zinc-400">{t("networkFeeLine")}</dt>
-                  <dd className="font-medium text-zinc-900 dark:text-zinc-50 tabular-nums">
-                    {estimatedNetworkFeeXlm.toLocaleString(undefined, {
-                      maximumFractionDigits: 7,
-                    })}{" "}
-                    XLM
-                  </dd>
-                </div>
-                <div className="flex justify-between gap-4 border-t border-zinc-200 dark:border-zinc-600 pt-2">
-                  <dt className="font-semibold text-zinc-900 dark:text-zinc-50">
-                    {t("totalLine")}
-                  </dt>
-                  <dd className="font-semibold text-zinc-900 dark:text-zinc-50 tabular-nums">
-                    {totalWalletCost.toLocaleString(undefined, { maximumFractionDigits: 7 })} XLM
-                  </dd>
-                </div>
-              </dl>
-            )}
-
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               {t("platformFeeNote", { feePercent: basisPointsToPercentage(platformFeeBps) })}
             </p>
             {amountNum > 0 && (
               <p className="text-xs text-zinc-500 dark:text-zinc-400">{t("networkFeeNote")}</p>
             )}
-
-            <button
-              onClick={handleDonate}
-              disabled={!publicKey || !validation.valid}
-              className="w-full py-3 bg-linear-to-r from-blue-500 to-purple-500 hover:from-blue-600 hover:to-purple-600 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold rounded-xl transition-all duration-200"
-            >
-              {amountNum > 0 ? t("donateAmount", { amount: amountNum }) : t("donate")}
-            </button>
 
             {/* #637 — fiat on-ramp so non-crypto users can buy XLM to donate.
                 Renders nothing unless a provider is configured via env vars. */}
@@ -474,7 +540,12 @@ export default function DonationModal({
         )}
 
         {step === "pending" && (
-          <div className="flex flex-col items-center gap-4 py-6">
+          <div
+            ref={statusRef}
+            tabIndex={-1}
+            role="status"
+            className="focus-ring flex flex-col items-center gap-4 rounded-control py-6"
+          >
             <div className="w-12 h-12 rounded-full border-4 border-blue-500 border-t-transparent motion-safe:animate-spin" />
             <p className="text-zinc-600 dark:text-zinc-400 text-sm text-center">
               {txPhase === "signing"
@@ -487,7 +558,12 @@ export default function DonationModal({
         )}
 
         {step === "confirmed" && (
-          <div className="flex flex-col items-center gap-4 py-4 text-center">
+          <div
+            ref={statusRef}
+            tabIndex={-1}
+            role="status"
+            className="focus-ring flex flex-col items-center gap-4 rounded-control py-4 text-center"
+          >
             <div className="w-14 h-14 rounded-full bg-green-100 dark:bg-green-900 flex items-center justify-center text-3xl">
               ✓
             </div>
@@ -538,6 +614,22 @@ export default function DonationModal({
           </div>
         )}
       </div>
+      {step === "input" && (
+        <div className="contribution-footer shrink-0 border-t border-zinc-200 bg-white/95 px-4 pt-3 backdrop-blur-sm sm:px-6 dark:border-zinc-700 dark:bg-zinc-900/95">
+          <button
+            onClick={handleDonate}
+            disabled={!publicKey || !validation.valid}
+            className="tap-target focus-ring w-full rounded-control bg-linear-to-r from-brand to-accent py-3 font-semibold text-white transition-opacity duration-[140ms] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none"
+          >
+            {amountNum > 0 ? t("donateAmount", { amount: amountNum }) : t("donate")}
+          </button>
+          <p className="mt-2 text-center text-xs text-zinc-600 dark:text-zinc-300">
+            {t("walletApproval")}
+          </p>
+        </div>
+      )}
     </Modal>
   );
 }
+
+export default memo(DonationModal);

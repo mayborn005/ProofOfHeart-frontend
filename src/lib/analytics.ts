@@ -15,6 +15,7 @@
  */
 
 import { getAnalyticsProvider } from "@/lib/thirdParty";
+import { getItem, setItem, removeItem } from "./localStorageStore";
 
 declare global {
   interface Window {
@@ -52,11 +53,9 @@ function isAnalyticsEnabled(): boolean {
   }
 
   // Check if user has opted out (stored in localStorage)
-  if (typeof window !== "undefined") {
-    const optOut = localStorage.getItem("analytics_opt_out");
-    if (optOut === "true") {
-      return false;
-    }
+  const optOut = getItem<string>("analytics_opt_out");
+  if (optOut === "true") {
+    return false;
   }
 
   return true;
@@ -228,26 +227,41 @@ export function trackContributionError(campaignId: number, errorType: string): v
  * Allows users to opt out of analytics.
  */
 export function optOutOfAnalytics(): void {
-  if (typeof window !== "undefined") {
-    localStorage.setItem("analytics_opt_out", "true");
-  }
+  setItem("analytics_opt_out", "true");
 }
 
 /**
  * Allows users to opt back in to analytics.
  */
 export function optInToAnalytics(): void {
-  if (typeof window !== "undefined") {
-    localStorage.removeItem("analytics_opt_out");
-  }
+  removeItem("analytics_opt_out");
 }
 
 /**
  * Checks if user has opted out of analytics.
  */
 export function hasOptedOutOfAnalytics(): boolean {
-  if (typeof window !== "undefined") {
-    return localStorage.getItem("analytics_opt_out") === "true";
-  }
-  return false;
+  return getItem<string>("analytics_opt_out") === "true";
+}
+
+export interface WebVitalMetric {
+  name: "CLS" | "FCP" | "FID" | "INP" | "LCP" | "TTFB";
+  value: number;
+  rating?: "good" | "needs-improvement" | "poor";
+  id?: string;
+  navigationType?: string;
+}
+
+/**
+ * Tracks Web Vitals performance metrics (LCP, FID, CLS, INP, etc.)
+ */
+export function trackWebVital(metric: WebVitalMetric): void {
+  sendAnalyticsEvent("web_vitals", {
+    metric: metric.name,
+    value: metric.value,
+    rating: metric.rating ?? (metric.value <= 2500 ? "good" : "poor"),
+    metricId: metric.id,
+    navigationType: metric.navigationType,
+    timestamp: Date.now(),
+  });
 }

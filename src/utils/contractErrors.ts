@@ -30,6 +30,38 @@ export enum ContractError {
   NotTokenHolder = 17,
   VotingQuorumNotMet = 18,
   VotingThresholdNotMet = 19,
+  AlreadyClaimed = 20,
+  InvalidMilestone = 21,
+  MilestoneNotFound = 22,
+  MilestoneAlreadyApproved = 23,
+  ContractPaused = 24,
+  ContributionCapExceeded = 25,
+  CampaignNotVerified = 26,
+  InvalidAmount = 27,
+  TransferFailed = 28,
+  InsufficientBalance = 29,
+  Overflow = 30,
+  Underflow = 31,
+  CreationDisabled = 32,
+  InvalidFee = 33,
+  AlreadyInitialized = 34,
+  NotInitialized = 35,
+  InvalidAddress = 36,
+  Expired = 37,
+  InvalidSignature = 38,
+  UnauthorizedAdmin = 39,
+  InvalidVestingSchedule = 40,
+  InvalidVestingDelay = 41,
+  /** Campaign is already in the wallet's saved list (bookmarks, #1674). */
+  CampaignAlreadyBookmarked = 44,
+  /** Campaign is not in the wallet's saved list (bookmarks, #1674). */
+  CampaignNotBookmarked = 45,
+  /** Wallet reached the on-chain saved-list size limit (bookmarks, #1674). */
+  BookmarkLimitReached = 47,
+  /** Milestone has not been verified yet (milestone payouts, #1671/#1672). */
+  MilestoneNotVerified = 49,
+  /** Milestone has already been claimed (milestone payouts, #1671/#1672). */
+  MilestoneAlreadyClaimed = 50,
 }
 
 // ---------------------------------------------------------------------------
@@ -58,7 +90,44 @@ export const errorTranslationKeys: Record<ContractError, string> = {
   [ContractError.NotTokenHolder]: "ContractErrors.NotTokenHolder",
   [ContractError.VotingQuorumNotMet]: "ContractErrors.VotingQuorumNotMet",
   [ContractError.VotingThresholdNotMet]: "ContractErrors.VotingThresholdNotMet",
+  [ContractError.AlreadyClaimed]: "ContractErrors.AlreadyClaimed",
+  [ContractError.InvalidMilestone]: "ContractErrors.InvalidMilestone",
+  [ContractError.MilestoneNotFound]: "ContractErrors.MilestoneNotFound",
+  [ContractError.MilestoneAlreadyApproved]: "ContractErrors.MilestoneAlreadyApproved",
+  [ContractError.ContractPaused]: "ContractErrors.ContractPaused",
+  [ContractError.ContributionCapExceeded]: "ContractErrors.ContributionCapExceeded",
+  [ContractError.CampaignNotVerified]: "ContractErrors.CampaignNotVerified",
+  [ContractError.InvalidAmount]: "ContractErrors.InvalidAmount",
+  [ContractError.TransferFailed]: "ContractErrors.TransferFailed",
+  [ContractError.InsufficientBalance]: "ContractErrors.InsufficientBalance",
+  [ContractError.Overflow]: "ContractErrors.Overflow",
+  [ContractError.Underflow]: "ContractErrors.Underflow",
+  [ContractError.CreationDisabled]: "ContractErrors.CreationDisabled",
+  [ContractError.InvalidFee]: "ContractErrors.InvalidFee",
+  [ContractError.AlreadyInitialized]: "ContractErrors.AlreadyInitialized",
+  [ContractError.NotInitialized]: "ContractErrors.NotInitialized",
+  [ContractError.InvalidAddress]: "ContractErrors.InvalidAddress",
+  [ContractError.Expired]: "ContractErrors.Expired",
+  [ContractError.InvalidSignature]: "ContractErrors.InvalidSignature",
+  [ContractError.UnauthorizedAdmin]: "ContractErrors.UnauthorizedAdmin",
+  [ContractError.InvalidVestingSchedule]: "ContractErrors.InvalidVestingSchedule",
+  [ContractError.InvalidVestingDelay]: "ContractErrors.InvalidVestingDelay",
+  [ContractError.CampaignAlreadyBookmarked]: "ContractErrors.CampaignAlreadyBookmarked",
+  [ContractError.CampaignNotBookmarked]: "ContractErrors.CampaignNotBookmarked",
+  [ContractError.BookmarkLimitReached]: "ContractErrors.BookmarkLimitReached",
+  [ContractError.MilestoneNotVerified]: "ContractErrors.MilestoneNotVerified",
+  [ContractError.MilestoneAlreadyClaimed]: "ContractErrors.MilestoneAlreadyClaimed",
 };
+
+const CONTRACT_ERROR_KEYS = new Set(Object.values(errorTranslationKeys));
+
+/**
+ * True when `message` is a contract revert translation key, i.e. the contract
+ * rejected the call. Such errors are deterministic, so retrying cannot help.
+ */
+export function isContractErrorMessage(message: string | null | undefined): boolean {
+  return !!message && CONTRACT_ERROR_KEYS.has(message);
+}
 
 // ---------------------------------------------------------------------------
 // Typed error class
@@ -94,7 +163,15 @@ export function getContractErrorCode(error: unknown): ContractError | null {
   } else if (typeof error === "string") {
     message = error;
   } else if (typeof error === "object" && error !== null) {
-    message = (error as any).message || (error as any).error?.message || JSON.stringify(error);
+    const obj = error as Record<string, unknown>;
+    const inner =
+      typeof obj.error === "object" && obj.error !== null
+        ? (obj.error as Record<string, unknown>)
+        : undefined;
+    message =
+      (typeof obj.message === "string" ? obj.message : "") ||
+      (inner && typeof inner.message === "string" ? inner.message : "") ||
+      JSON.stringify(error);
   }
 
   if (message) {
@@ -118,6 +195,56 @@ export function getContractErrorCode(error: unknown): ContractError | null {
   }
 
   return null;
+}
+
+/**
+ * Soroban errors are not consistent about where they put the useful detail:
+ * simulation errors use `error`, submission errors may use `errorResult`, and
+ * SDK/network wrappers often put it in `cause`. Flatten those shapes before
+ * looking for a contract code or a well-known host error.
+ */
+function stringifyError(error: unknown, seen = new Set<unknown>()): string {
+  if (error == null || seen.has(error)) return "";
+  if (typeof error === "string") return error;
+  if (typeof error === "number" || typeof error === "bigint") return String(error);
+  if (typeof error !== "object") return "";
+
+  seen.add(error);
+  const value = error as Record<string, unknown>;
+  const parts = [
+    error instanceof Error ? error.message : "",
+    stringifyError(value.error, seen),
+    error instanceof Error ? "" : stringifyError(value.message, seen),
+    stringifyError(value.errorResult, seen),
+    stringifyError(value.result, seen),
+    stringifyError(value.cause, seen),
+    stringifyError(value.data, seen),
+  ];
+  return parts.filter(Boolean).join(" ");
+}
+
+/** Convert RPC/SDK revert shapes into stable, user-facing contract errors. */
+export function normalizeContractError(
+  error: unknown,
+  fallback = "Transaction failed on-chain.",
+): Error {
+  const code = getContractErrorCode(error);
+  if (code !== null) return new ContractErrorException(code);
+
+  const detail = stringifyError(error);
+  if (/insufficient\s+(?:balance|funds)|underfunded|tx_insufficient_balance/i.test(detail)) {
+    return new ContractErrorException(ContractError.InsufficientBalance);
+  }
+  if (
+    /auth(?:entication|orization)?\s+(?:failed|failure)|not authorized|unauthorized|tx_bad_auth/i.test(
+      detail,
+    )
+  ) {
+    return new ContractErrorException(ContractError.NotAuthorized);
+  }
+
+  if (error instanceof Error && error.message) return error;
+  return new Error(detail || fallback);
 }
 
 /**
@@ -155,7 +282,14 @@ export function parseContractError(error: unknown): string {
   } else if (typeof error === "string") {
     message = error;
   } else if (typeof error === "object" && error !== null) {
-    message = (error as any).message || (error as any).error?.message || "";
+    const obj = error as Record<string, unknown>;
+    const inner =
+      typeof obj.error === "object" && obj.error !== null
+        ? (obj.error as Record<string, unknown>)
+        : undefined;
+    message =
+      (typeof obj.message === "string" ? obj.message : "") ||
+      (inner && typeof inner.message === "string" ? inner.message : "");
   }
 
   // Return the raw message if it looks human-readable (not a stack trace)

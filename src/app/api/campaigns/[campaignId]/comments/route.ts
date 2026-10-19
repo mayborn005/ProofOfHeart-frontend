@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { Comment } from "@/types";
-import { commentStore } from "@/lib/commentStore";
+import { getCommentRepository } from "@/lib/commentRepository";
 import { createRateLimiter } from "@/lib/rateLimit";
+import { CreateCommentBodySchema } from "@/lib/schemas";
+import { hashComment } from "@/lib/commentHash";
+import { filterCensuredComments } from "@/lib/commentCensure";
 
 const PAGE_SIZE = 20;
-const MAX_CONTENT_LENGTH = 2000;
 
-const commentRateLimiter = createRateLimiter(60_000, 5);
+const commentRateLimiter = createRateLimiter("campaign_comments", 60_000, 5);
 
 // GET /api/campaigns/[campaignId]/comments?page=1&pageSize=20
 export async function GET(
@@ -26,7 +28,9 @@ export async function GET(
     Math.max(1, parseInt(url.searchParams.get("pageSize") ?? String(PAGE_SIZE), 10)),
   );
 
-  const all = (commentStore.get(campaignId) ?? []).filter((c) => !c.isReported);
+  const stored = await getCommentRepository().list(campaignId);
+  const notCensured = await filterCensuredComments(campaignId, stored);
+  const all = notCensured.filter((c) => !c.isReported);
   const total = all.length;
   const items = all.slice((page - 1) * pageSize, page * pageSize);
 
@@ -44,60 +48,57 @@ export async function POST(
     return NextResponse.json({ message: "Invalid campaign ID" }, { status: 400 });
   }
 
-  let body: {
-    content?: string;
-    authorAddress?: string;
-    timestamp?: number;
-    parentId?: string | null;
-    signature?: string;
-  };
+  let rawBody: unknown;
   try {
-    body = await req.json();
+    rawBody = await req.json();
   } catch {
     return NextResponse.json({ message: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { content, authorAddress, timestamp, parentId = null, signature } = body;
-
-  if (!content || typeof content !== "string" || content.trim().length === 0) {
-    return NextResponse.json({ message: "Content is required" }, { status: 400 });
-  }
-  if (content.length > MAX_CONTENT_LENGTH) {
+  const parsed = CreateCommentBodySchema.safeParse(rawBody);
+  if (!parsed.success) {
+    const firstIssue = parsed.error.issues[0];
     return NextResponse.json(
-      { message: `Content must be at most ${MAX_CONTENT_LENGTH} characters` },
+      { message: firstIssue?.message ?? "Invalid request body" },
       { status: 400 },
     );
   }
-  if (!authorAddress || typeof authorAddress !== "string") {
-    return NextResponse.json({ message: "Author address is required" }, { status: 400 });
-  }
-  if (!signature || typeof signature !== "string") {
-    return NextResponse.json({ message: "Signature is required" }, { status: 400 });
-  }
+
+  const { content, authorAddress, timestamp, parentId, signature } = parsed.data;
 
   const rateLimitKey = `${authorAddress}:${campaignId}`;
-  if (!commentRateLimiter.check(rateLimitKey)) {
+  if (!(await commentRateLimiter.check(rateLimitKey))) {
     return NextResponse.json(
       { message: "Too many requests. Please wait before posting again." },
       { status: 429 },
     );
   }
 
-  const existing = commentStore.get(campaignId) ?? [];
+  const repository = getCommentRepository();
+  const existing = await repository.list(campaignId);
+
+  const resolvedTimestamp =
+    typeof timestamp === "number" ? timestamp : 1700000000000 + existing.length * 1000;
 
   const comment: Comment = {
     id: `comment-${campaignId}-${existing.length + 1}`,
     campaignId,
     content: content.trim(),
     authorAddress,
-    timestamp: typeof timestamp === "number" ? timestamp : 1700000000000 + existing.length * 1000,
+    timestamp: resolvedTimestamp,
     parentId: parentId ?? null,
     signature,
     isPinned: false,
     isReported: false,
+    commentHash: hashComment({
+      campaignId,
+      content: content.trim(),
+      authorAddress,
+      timestamp: resolvedTimestamp,
+    }),
   };
 
-  commentStore.set(campaignId, [...existing, comment]);
+  await repository.add(campaignId, comment);
 
   return NextResponse.json(comment, { status: 201 });
 }

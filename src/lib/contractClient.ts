@@ -1,4 +1,17 @@
-import * as StellarSdk from "@stellar/stellar-sdk";
+import {
+  Account,
+  Address,
+  BASE_FEE,
+  Contract,
+  Keypair,
+  Memo,
+  Transaction,
+  TransactionBuilder,
+  nativeToScVal,
+  rpc,
+  scValToBigInt,
+  xdr,
+} from "@stellar/stellar-sdk";
 // #649 — Signing goes through the active wallet signer (Freighter or an
 // embedded social wallet) rather than the Freighter API directly.
 import { getSignerAddress, signTransactionXdr } from "./walletSigner";
@@ -11,8 +24,21 @@ import {
   recordObservabilitySuccess,
 } from "./observability";
 import { appendWalletTransaction } from "./transactionLog";
-import { Campaign, Category, deriveStatus, CampaignStatus, Milestone } from "../types";
-import { parseContractError, getContractErrorCode, ContractError } from "../utils/contractErrors";
+import {
+  Campaign,
+  Category,
+  deriveStatus,
+  CampaignStatus,
+  Milestone,
+  ContractMilestone,
+} from "../types";
+import {
+  parseContractError,
+  getContractErrorCode,
+  normalizeContractError,
+  ContractError,
+  ContractErrorException,
+} from "../utils/contractErrors";
 import { wrapFreighterError } from "../utils/freighterErrors";
 import {
   validateStellarAddress,
@@ -33,6 +59,16 @@ const SOROBAN_RPC_URL =
   process.env.NEXT_PUBLIC_RPC_URL ??
   "https://soroban-testnet.stellar.org";
 
+/** Secondary node used while the primary is slow or unreachable. Optional. */
+const SOROBAN_RPC_FALLBACK_URL = process.env.NEXT_PUBLIC_SOROBAN_RPC_FALLBACK_URL?.trim() ?? "";
+
+/** A primary call slower than this switches traffic to the fallback node. */
+export const RPC_LATENCY_THRESHOLD_MS =
+  Number(process.env.NEXT_PUBLIC_RPC_LATENCY_THRESHOLD_MS) || 3_000;
+
+/** How long the fallback is used before the primary is tried again. */
+export const RPC_PRIMARY_RETRY_AFTER_MS = 60_000;
+
 const CONTRACT_ADDRESS =
   process.env.NEXT_PUBLIC_CONTRACT_ADDRESS ?? process.env.NEXT_PUBLIC_CONTRACT_ID ?? "";
 
@@ -40,12 +76,7 @@ const NETWORK_PASSPHRASE =
   process.env.NEXT_PUBLIC_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
 
 export type TransactionLifecyclePhase =
-  | "building"
-  | "signing"
-  | "submitting"
-  | "confirming"
-  | "confirmed"
-  | "failed";
+  "building" | "signing" | "submitting" | "confirming" | "confirmed" | "failed";
 
 export interface TransactionLifecycleUpdate {
   phase: TransactionLifecyclePhase;
@@ -58,19 +89,126 @@ export interface TransactionLifecycleOptions {
   timeoutMs?: number;
   /** Soroban contract method name for observability metrics. */
   operation?: string;
+  /** Optional memo to attach to the transaction (e.g. campaign/cause ID). */
+  memo?: string;
 }
 
 // ---------------------------------------------------------------------------
 // Soroban RPC server (lazily initialised)
 // ---------------------------------------------------------------------------
 
-let _server: StellarSdk.rpc.Server | null = null;
+let _server: rpc.Server | null = null;
+let _serverUrl: string | null = null;
+let primaryDegradedUntil = 0;
 
-function getServer(): StellarSdk.rpc.Server {
-  if (!_server) {
-    _server = new StellarSdk.rpc.Server(SOROBAN_RPC_URL);
+/** The RPC endpoint calls currently go to (the fallback while the primary is degraded). */
+export function getActiveRpcUrl(): string {
+  return SOROBAN_RPC_FALLBACK_URL && Date.now() < primaryDegradedUntil
+    ? SOROBAN_RPC_FALLBACK_URL
+    : SOROBAN_RPC_URL;
+}
+
+function getServer(): rpc.Server {
+  const url = getActiveRpcUrl();
+  if (!_server || _serverUrl !== url) {
+    _server = new rpc.Server(url);
+    _serverUrl = url;
   }
   return _server;
+}
+
+function markPrimaryDegraded(reason: string): void {
+  primaryDegradedUntil = Date.now() + RPC_PRIMARY_RETRY_AFTER_MS;
+  console.warn(
+    `[contractClient] Primary Soroban RPC ${reason}; using fallback ${SOROBAN_RPC_FALLBACK_URL} for ${RPC_PRIMARY_RETRY_AFTER_MS / 1000}s.`,
+  );
+}
+
+class RpcLatencyExceededError extends Error {
+  constructor() {
+    super(`Soroban RPC did not respond within ${RPC_LATENCY_THRESHOLD_MS}ms`);
+    this.name = "RpcLatencyExceededError";
+  }
+}
+
+/** Rejects with RpcLatencyExceededError if `call` takes longer than the threshold. */
+function withLatencyBudget<T>(call: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const budget = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new RpcLatencyExceededError()), RPC_LATENCY_THRESHOLD_MS);
+  });
+  // The slow call keeps running; swallow its eventual outcome.
+  call.catch(() => undefined);
+  return Promise.race([call, budget]).finally(() => clearTimeout(timer));
+}
+
+// ---------------------------------------------------------------------------
+// Contract call response cache
+// ---------------------------------------------------------------------------
+
+interface CacheEntry<T> {
+  value: T;
+  timestamp: number;
+}
+
+// Cache storage: method_args -> { value, timestamp }
+const contractCallCache = new Map<string, CacheEntry<unknown>>();
+
+// Default TTL: 30 seconds for view methods
+const DEFAULT_CACHE_TTL_MS = 30_000;
+
+/**
+ * Generates a cache key from method name and arguments.
+ */
+function getCacheKey(method: string, args: xdr.ScVal[]): string {
+  const argsStr = args.map((arg) => arg.toXDR().toString("base64")).join(",");
+  return `${method}:${argsStr}`;
+}
+
+/**
+ * Retrieves a cached value if it exists and is not expired.
+ */
+function getCachedValue<T>(key: string, ttlMs: number = DEFAULT_CACHE_TTL_MS): T | null {
+  const entry = contractCallCache.get(key) as CacheEntry<T> | undefined;
+  if (!entry) return null;
+
+  const age = Date.now() - entry.timestamp;
+  if (age > ttlMs) {
+    contractCallCache.delete(key);
+    return null;
+  }
+
+  return entry.value;
+}
+
+/**
+ * Stores a value in the cache.
+ */
+function setCachedValue<T>(key: string, value: T): void {
+  contractCallCache.set(key, {
+    value,
+    timestamp: Date.now(),
+  });
+}
+
+/**
+ * Clears all cached contract call responses.
+ */
+export function clearContractCache(): void {
+  contractCallCache.clear();
+}
+
+/**
+ * Clears cache entries matching a specific method (e.g., "get_campaign").
+ */
+export function clearContractCacheByMethod(method: string): void {
+  const keysToDelete: string[] = [];
+  for (const key of contractCallCache.keys()) {
+    if (key.startsWith(`${method}:`)) {
+      keysToDelete.push(key);
+    }
+  }
+  keysToDelete.forEach((key) => contractCallCache.delete(key));
 }
 
 /**
@@ -79,6 +217,16 @@ function getServer(): StellarSdk.rpc.Server {
  */
 export function resetRpcServer(): void {
   _server = null;
+  _serverUrl = null;
+  primaryDegradedUntil = 0;
+}
+
+/**
+ * Drops all cached contract call results. Exported for tests and for callers
+ * that need to bypass the response cache (e.g. after a wallet switch).
+ */
+export function clearContractCallCache(): void {
+  contractCallCache.clear();
 }
 
 const CONNECTION_ERROR_PATTERNS = [
@@ -129,17 +277,47 @@ function isConnectionError(error: unknown): boolean {
  * the cached client unusable for every later call, so it is dropped before the
  * error propagates and the next call reconnects. Errors the node returned
  * (contract errors, bad requests) keep the client in place.
+ *
+ * When NEXT_PUBLIC_SOROBAN_RPC_FALLBACK_URL is set, a primary call that is
+ * slower than RPC_LATENCY_THRESHOLD_MS or fails at the transport level is
+ * retried on the fallback right away, and the fallback stays active for
+ * RPC_PRIMARY_RETRY_AFTER_MS before the primary is tried again.
  */
-async function withRpcServer<T>(fn: (server: StellarSdk.rpc.Server) => Promise<T>): Promise<T> {
-  const server = getServer();
-  try {
-    return await fn(server);
-  } catch (error) {
-    if (isConnectionError(error)) {
-      resetRpcServer();
+const RPC_RETRY_DELAYS_MS = [500, 1_000, 2_000];
+
+async function withRpcServer<T>(fn: (server: rpc.Server) => Promise<T>): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= RPC_RETRY_DELAYS_MS.length; attempt += 1) {
+    const onPrimary = Boolean(SOROBAN_RPC_FALLBACK_URL) && getActiveRpcUrl() === SOROBAN_RPC_URL;
+    const server = getServer();
+    try {
+      return await (onPrimary ? withLatencyBudget(Promise.resolve(fn(server))) : fn(server));
+    } catch (error) {
+      lastError = error;
+      if (onPrimary && error instanceof RpcLatencyExceededError) {
+        markPrimaryDegraded(`exceeded ${RPC_LATENCY_THRESHOLD_MS}ms`);
+        continue;
+      }
+      if (!isConnectionError(error)) {
+        throw error;
+      }
+      if (onPrimary) {
+        markPrimaryDegraded("is unreachable");
+        continue;
+      }
+
+      _server = null;
+      _serverUrl = null;
+      const retryDelay = RPC_RETRY_DELAYS_MS[attempt];
+      if (retryDelay === undefined) {
+        throw error;
+      }
+      await sleep(retryDelay);
     }
-    throw error;
   }
+
+  throw lastError;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -153,7 +331,7 @@ function sleep(ms: number): Promise<void> {
 const ACCOUNT_CACHE_TTL_MS = 10_000;
 
 interface CachedAccount {
-  account: StellarSdk.Account;
+  account: Account;
   fetchedAt: number;
   sequenceOnFetch: string;
 }
@@ -165,7 +343,7 @@ const _accountCache = new Map<string, CachedAccount>();
  * ACCOUNT_CACHE_TTL_MS and the sequence number hasn't diverged.
  * On sequence mismatch the cache entry is discarded and a fresh lookup is made.
  */
-async function getCachedAccount(publicKey: string): Promise<StellarSdk.Account> {
+async function getCachedAccount(publicKey: string): Promise<Account> {
   const now = Date.now();
   const cached = _accountCache.get(publicKey);
 
@@ -190,15 +368,28 @@ async function getCachedAccount(publicKey: string): Promise<StellarSdk.Account> 
   return fresh;
 }
 
+/** Fail before campaign construction if the creator is not funded on Stellar. */
+async function requireExistingCreatorAccount(publicKey: string): Promise<void> {
+  try {
+    await getCachedAccount(publicKey);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (/404|not found|does not exist|resource missing/i.test(detail)) {
+      throw new Error("Creator account does not exist on the Stellar network.");
+    }
+    throw error;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers — transaction building & submission
 // ---------------------------------------------------------------------------
 
 async function buildAndSubmitTransaction(
   sourcePublicKey: string,
-  contractOp: StellarSdk.xdr.Operation,
+  contractOp: xdr.Operation,
   options?: TransactionLifecycleOptions,
-): Promise<StellarSdk.rpc.Api.GetSuccessfulTransactionResponse> {
+): Promise<rpc.Api.GetSuccessfulTransactionResponse> {
   const operation = options?.operation ?? "contract_invoke";
 
   options?.onStatus?.({ phase: "building" });
@@ -212,11 +403,14 @@ async function buildAndSubmitTransaction(
     throw error;
   }
 
-  const txBuilder = new StellarSdk.TransactionBuilder(sourceAccount, {
-    fee: StellarSdk.BASE_FEE,
+  const txBuilder = new TransactionBuilder(sourceAccount, {
+    fee: BASE_FEE,
     networkPassphrase: NETWORK_PASSPHRASE,
   });
   txBuilder.addOperation(contractOp);
+  if (options?.memo) {
+    txBuilder.addMemo(Memo.text(options.memo));
+  }
   txBuilder.setTimeout(300);
 
   const builtTx = txBuilder.build();
@@ -228,19 +422,16 @@ async function buildAndSubmitTransaction(
     throw error;
   }
 
-  if (StellarSdk.rpc.Api.isSimulationError(simulated)) {
-    const simulationError = new Error(simulated.error ?? "Transaction simulation failed.");
+  if (rpc.Api.isSimulationError(simulated)) {
+    const simulationError = normalizeContractError(simulated, "Transaction simulation failed.");
     recordObservabilityFailure(classifySimulationFailure(simulationError, operation), {
       operation,
     });
     throw simulationError;
   }
 
-  const preparedTx = StellarSdk.rpc
-    .assembleTransaction(
-      builtTx,
-      simulated as StellarSdk.rpc.Api.SimulateTransactionSuccessResponse,
-    )
+  const preparedTx = rpc
+    .assembleTransaction(builtTx, simulated as rpc.Api.SimulateTransactionSuccessResponse)
     .build();
 
   options?.onStatus?.({ phase: "signing" });
@@ -253,10 +444,7 @@ async function buildAndSubmitTransaction(
     wrapFreighterError(error);
   }
 
-  const signedTx = StellarSdk.TransactionBuilder.fromXDR(
-    signedTxXdr,
-    NETWORK_PASSPHRASE,
-  ) as StellarSdk.Transaction;
+  const signedTx = TransactionBuilder.fromXDR(signedTxXdr, NETWORK_PASSPHRASE) as Transaction;
 
   options?.onStatus?.({ phase: "submitting" });
   let submissionResult;
@@ -273,7 +461,7 @@ async function buildAndSubmitTransaction(
       operation,
       rpcStatus: submissionResult.status,
     });
-    throw new Error("Transaction submission failed.");
+    throw normalizeContractError(submissionResult, "Transaction submission failed.");
   }
 
   const txHash = submissionResult.hash;
@@ -293,7 +481,7 @@ async function buildAndSubmitTransaction(
     throw error;
   }
 
-  while (getResult.status === "NOT_FOUND" || (getResult.status as any) === "PENDING") {
+  while (getResult.status === "NOT_FOUND") {
     if (Date.now() - startedAt >= timeoutMs) {
       options?.onStatus?.({ phase: "failed", txHash, rpcStatus: getResult.status });
       recordObservabilityKind("confirmation_timeout", "Transaction confirmation timed out.", {
@@ -323,12 +511,12 @@ async function buildAndSubmitTransaction(
       rpcStatus: getResult.status,
       txHash,
     });
-    throw new Error("Transaction failed on-chain.");
+    throw normalizeContractError(getResult, "Transaction failed on-chain.");
   }
 
   options?.onStatus?.({ phase: "confirmed", txHash, rpcStatus: getResult.status });
   recordObservabilitySuccess(operation, txHash);
-  return getResult as StellarSdk.rpc.Api.GetSuccessfulTransactionResponse;
+  return getResult as rpc.Api.GetSuccessfulTransactionResponse;
 }
 
 function emitMockLifecycle(txHash: string, options?: TransactionLifecycleOptions): string {
@@ -340,17 +528,21 @@ function emitMockLifecycle(txHash: string, options?: TransactionLifecycleOptions
   return txHash;
 }
 
-async function invokeViewMethod(
-  method: string,
-  args: StellarSdk.xdr.ScVal[] = [],
-): Promise<StellarSdk.xdr.ScVal | null> {
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
+async function invokeViewMethod(method: string, args: xdr.ScVal[] = []): Promise<xdr.ScVal | null> {
+  // Check cache first
+  const cacheKey = getCacheKey(method, args);
+  const cached = getCachedValue<xdr.ScVal | null>(cacheKey);
+  if (cached !== null) {
+    return cached;
+  }
 
-  const zeroKeyPair = StellarSdk.Keypair.random();
-  const zeroAccount = new StellarSdk.Account(zeroKeyPair.publicKey(), "0");
+  const contract = new Contract(CONTRACT_ADDRESS);
 
-  const txBuilder = new StellarSdk.TransactionBuilder(zeroAccount, {
-    fee: StellarSdk.BASE_FEE,
+  const zeroKeyPair = Keypair.random();
+  const zeroAccount = new Account(zeroKeyPair.publicKey(), "0");
+
+  const txBuilder = new TransactionBuilder(zeroAccount, {
+    fee: BASE_FEE,
     networkPassphrase: NETWORK_PASSPHRASE,
   });
   txBuilder.addOperation(contract.call(method, ...args));
@@ -367,35 +559,40 @@ async function invokeViewMethod(
     throw error;
   }
 
-  if (StellarSdk.rpc.Api.isSimulationError(simulated)) {
-    const simulationError = new Error(simulated.error ?? `View call ${method} failed.`);
+  if (rpc.Api.isSimulationError(simulated)) {
+    const simulationError = normalizeContractError(simulated, `View call ${method} failed.`);
     recordObservabilityFailure(classifySimulationFailure(simulationError, method), {
       operation: method,
     });
     throw simulationError;
   }
 
-  const successSim = simulated as StellarSdk.rpc.Api.SimulateTransactionSuccessResponse;
-  return successSim.result?.retval ?? null;
+  const successSim = simulated as rpc.Api.SimulateTransactionSuccessResponse;
+  const result = successSim.result?.retval ?? null;
+
+  // Cache the result
+  setCachedValue(cacheKey, result);
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------
 // XDR ↔ TypeScript decoders
 // ---------------------------------------------------------------------------
 
-function decodeCampaign(val: StellarSdk.xdr.ScVal): Campaign {
+function decodeCampaign(val: xdr.ScVal): Campaign {
   const map = val.map();
   if (!map) throw new Error("Expected ScVal map for Campaign.");
 
-  const fields: Record<string, StellarSdk.xdr.ScVal> = {};
+  const fields: Record<string, xdr.ScVal> = {};
   for (const entry of map) {
     const key = entry.key().sym().toString();
     fields[key] = entry.val();
   }
 
-  const funding_goal = StellarSdk.scValToBigInt(fields["funding_goal"]);
+  const funding_goal = scValToBigInt(fields["funding_goal"]);
   const deadline = Number(fields["deadline"].u64());
-  const amount_raised = StellarSdk.scValToBigInt(fields["amount_raised"]);
+  const amount_raised = scValToBigInt(fields["amount_raised"]);
   const is_active = fields["is_active"].b();
   const funds_withdrawn = fields["funds_withdrawn"].b();
   const is_cancelled = fields["is_cancelled"].b();
@@ -403,7 +600,12 @@ function decodeCampaign(val: StellarSdk.xdr.ScVal): Campaign {
 
   let rawDescription = fields["description"].str().toString();
   let cover_image_url: string | undefined = undefined;
-  let milestones: any[] | undefined = undefined;
+  let milestones: Milestone[] | undefined = undefined;
+  // Contract fields carry no `tags`; fall back to that key only for older/mock
+  // records that may have stored it directly, otherwise default to [].
+  let tags: string[] = fields["tags"]
+    ? fields["tags"].vec().map((v: xdr.ScVal) => v.str().toString())
+    : [];
 
   const EXT_MARKER = "\n\n===POH_EXT===\n";
   const extIndex = rawDescription.indexOf(EXT_MARKER);
@@ -412,10 +614,15 @@ function decodeCampaign(val: StellarSdk.xdr.ScVal): Campaign {
       const extData = JSON.parse(rawDescription.substring(extIndex + EXT_MARKER.length));
       cover_image_url = extData.coverImageUrl;
       if (extData.milestones && Array.isArray(extData.milestones)) {
-        milestones = extData.milestones.map((m: any) => ({
-          targetAmount: BigInt(m.targetAmount),
-          description: m.description,
-        }));
+        milestones = extData.milestones.map(
+          (m: { targetAmount: string | number; description: string }) => ({
+            targetAmount: BigInt(m.targetAmount),
+            description: m.description,
+          }),
+        );
+      }
+      if (extData.tags && Array.isArray(extData.tags)) {
+        tags = extData.tags;
       }
     } catch (e) {
       console.warn("Failed to parse campaign extension data", e);
@@ -425,7 +632,7 @@ function decodeCampaign(val: StellarSdk.xdr.ScVal): Campaign {
 
   return {
     id: fields["id"].u32(),
-    creator: StellarSdk.Address.fromScVal(fields["creator"]).toString(),
+    creator: Address.fromScVal(fields["creator"]).toString(),
     title: fields["title"].str().toString(),
     description: rawDescription,
     funding_goal,
@@ -448,7 +655,7 @@ function decodeCampaign(val: StellarSdk.xdr.ScVal): Campaign {
     category: fields["category"].u32() as Category,
     has_revenue_sharing: fields["has_revenue_sharing"].b(),
     revenue_share_percentage: fields["revenue_share_percentage"].u32(),
-    tags: fields["tags"] ? (fields["tags"] as any).vec().map((v: any) => v.str().toString()) : [],
+    tags,
     cover_image_url,
     milestones,
   };
@@ -633,44 +840,163 @@ for (let i = 0; i < GENERATED_MOCK_COUNT; i++) {
 // Public API — Read (view) functions
 // ---------------------------------------------------------------------------
 
-export const DEFAULT_CAMPAIGNS_PAGE_SIZE = 12;
+/**
+ * Number of campaigns fetched per page on the /causes list (issue #1150).
+ * A larger initial page means the first viewport is filled in a single round-
+ * trip and the MIN_ROWS_BEFORE_PREFETCH guard in VirtualizedCauseGrid is not
+ * hit on first render, preventing the cascade-load of all pages upfront.
+ * Operators can tune this via NEXT_PUBLIC_CAMPAIGNS_PAGE_SIZE without a code
+ * change (e.g. lower it on mobile-only deployments with slower RPCs).
+ */
+export const DEFAULT_CAMPAIGNS_PAGE_SIZE: number =
+  Number(process.env.NEXT_PUBLIC_CAMPAIGNS_PAGE_SIZE) > 0
+    ? Number(process.env.NEXT_PUBLIC_CAMPAIGNS_PAGE_SIZE)
+    : 20;
+
+/** Contract-enforced page size cap (LIST_MAX_LIMIT) for every paginated view. */
+export const LIST_MAX_LIMIT = 50;
 
 export interface CampaignsPage {
   campaigns: Campaign[];
-  /** Id of the next campaign to fetch, or null once every campaign has been returned. */
+  /**
+   * Opaque cursor for the next page, or null once the listing is exhausted.
+   * Unfiltered listings use "next campaign id" (1-based); category/creator
+   * listings use a zero-based position in that index. Seed the first page with
+   * `initialCampaignsCursor(filters)`.
+   */
   nextCursor: number | null;
 }
 
+export interface ListCampaignsParams {
+  cursor?: number;
+  limit?: number;
+  /** Uses the contract's `get_campaigns_by_category` index. */
+  category?: Category;
+  /** Uses the contract's `get_creator_campaigns` index. */
+  creator?: string;
+}
+
+/** First cursor to pass to `listCampaigns` for a given filter combination. */
+export function initialCampaignsCursor(filters: { category?: Category; creator?: string } = {}) {
+  return filters.category !== undefined || filters.creator ? 0 : 1;
+}
+
+/** Decodes a `(Vec<Campaign>, u32)` page tuple returned by the paginated views. */
+function decodeCampaignPage(result: xdr.ScVal | null): { campaigns: Campaign[]; next: number } {
+  const [page, next] = result?.vec() ?? [];
+  if (!page || !next) return { campaigns: [], next: 0 };
+  const campaigns = (page.vec() ?? []).map((c) => decodeCampaign(c));
+  return { campaigns, next: next.u32() };
+}
+
 /**
- * Cursor-paginated campaign listing (issue #593). The contract only exposes
- * sequential numeric ids (`get_campaign_count` + `get_campaign(id)`), so the
- * cursor here is simply "the next id to fetch" — opaque to the caller, which
- * is all `useInfiniteQuery` needs.
+ * Cursor-paginated campaign listing. Each call issues exactly ONE contract
+ * view (never one per campaign):
+ *  - no filter        -> `list_campaigns(start, limit)`
+ *  - `category`       -> `get_campaigns_by_category(category, offset, limit)`
+ *  - `creator`        -> `get_creator_campaigns(creator, start, limit)`
+ * Loading N visible campaigns therefore costs at most ceil(N / LIST_MAX_LIMIT)
+ * RPC simulations.
  */
 export async function listCampaigns({
-  cursor = 1,
+  cursor,
   limit = DEFAULT_CAMPAIGNS_PAGE_SIZE,
-}: { cursor?: number; limit?: number } = {}): Promise<CampaignsPage> {
+  category,
+  creator,
+}: ListCampaignsParams = {}): Promise<CampaignsPage> {
+  const filtered = category !== undefined || !!creator;
+  const position = cursor ?? initialCampaignsCursor({ category, creator });
+  const pageLimit = Math.max(1, Math.min(limit, LIST_MAX_LIMIT));
+
   if (USE_MOCKS) {
-    const startIndex = cursor - 1;
-    const campaigns = MOCK_CAMPAIGNS.slice(startIndex, startIndex + limit);
-    const nextCursor = startIndex + limit < MOCK_CAMPAIGNS.length ? cursor + limit : null;
+    const source = filtered
+      ? MOCK_CAMPAIGNS.filter(
+          (c) =>
+            (category === undefined || c.category === category) &&
+            (!creator || c.creator === creator),
+        )
+      : MOCK_CAMPAIGNS;
+    const startIndex = filtered ? position : position - 1;
+    const campaigns = source.slice(startIndex, startIndex + pageLimit);
+    const nextCursor = startIndex + pageLimit < source.length ? position + pageLimit : null;
     return { campaigns, nextCursor };
   }
+
   try {
-    const count = await getCampaignCount();
-    const lastIdExclusive = Math.min(cursor + limit, count + 1);
-    const ids = Array.from({ length: Math.max(0, lastIdExclusive - cursor) }, (_, i) => cursor + i);
-    const results = await Promise.allSettled(ids.map((id) => getCampaign(id)));
-    const campaigns = results.flatMap((r) => {
-      if (r.status === "rejected") {
-        console.warn("Failed to fetch campaign for listCampaigns page", r.reason);
-        return [];
-      }
-      return r.value !== null ? [r.value] : [];
-    });
-    const nextCursor = cursor + limit <= count ? cursor + limit : null;
-    return { campaigns, nextCursor };
+    if (!filtered) {
+      // list_campaigns' `start` is an exclusive id cursor; our cursor is "next id".
+      const result = await invokeViewMethod("list_campaigns", [
+        nativeToScVal(Math.max(0, position - 1), { type: "u32" }),
+        nativeToScVal(pageLimit, { type: "u32" }),
+      ]);
+      const { campaigns, next } = decodeCampaignPage(result);
+      const exhausted = campaigns.length < pageLimit || next + 1 <= position;
+      return { campaigns, nextCursor: exhausted ? null : next + 1 };
+    }
+
+    const result = creator
+      ? await invokeViewMethod("get_creator_campaigns", [
+          new Address(creator).toScVal(),
+          nativeToScVal(position, { type: "u32" }),
+          nativeToScVal(pageLimit, { type: "u32" }),
+        ])
+      : await invokeViewMethod("get_campaigns_by_category", [
+          nativeToScVal(category, { type: "u32" }),
+          nativeToScVal(position, { type: "u32" }),
+          nativeToScVal(pageLimit, { type: "u32" }),
+        ]);
+    const { campaigns: indexed, next } = decodeCampaignPage(result);
+    // The creator index has no category filter; narrow it client-side when both are set.
+    const campaigns =
+      creator && category !== undefined ? indexed.filter((c) => c.category === category) : indexed;
+    const exhausted = indexed.length < pageLimit || next <= position;
+    return { campaigns, nextCursor: exhausted ? null : next };
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+export interface ContractPlatformStats {
+  totalCampaigns: number;
+  activeCampaigns: number;
+  verifiedCampaigns: number;
+  cancelledCampaigns: number;
+  totalAmountRaised: bigint;
+  /** True when the contract flags its counters as inconsistent. */
+  statsArePartial: boolean;
+}
+
+/** Aggregate counts from `get_platform_stats` — one RPC call, no campaign scan. */
+export async function getPlatformStats(): Promise<ContractPlatformStats> {
+  if (USE_MOCKS) {
+    return {
+      totalCampaigns: MOCK_CAMPAIGNS.length,
+      activeCampaigns: MOCK_CAMPAIGNS.filter((c) => c.is_active && !c.is_cancelled).length,
+      verifiedCampaigns: MOCK_CAMPAIGNS.filter((c) => c.is_verified).length,
+      cancelledCampaigns: MOCK_CAMPAIGNS.filter((c) => c.is_cancelled).length,
+      totalAmountRaised: MOCK_CAMPAIGNS.reduce((sum, c) => sum + c.amount_raised, BigInt(0)),
+      statsArePartial: false,
+    };
+  }
+  try {
+    const result = await invokeViewMethod("get_platform_stats");
+    const map = result?.map();
+    if (!map) throw new Error("Expected ScVal map for PlatformStats.");
+    const fields: Record<string, xdr.ScVal> = {};
+    for (const entry of map) fields[entry.key().sym().toString()] = entry.val();
+    const field = (name: string): xdr.ScVal => {
+      const value = fields[name];
+      if (!value) throw new Error(`PlatformStats is missing ${name}.`);
+      return value;
+    };
+    return {
+      totalCampaigns: field("total_campaigns").u32(),
+      activeCampaigns: field("active_campaigns").u32(),
+      verifiedCampaigns: field("verified_campaigns").u32(),
+      cancelledCampaigns: field("cancelled_campaigns").u32(),
+      totalAmountRaised: scValToBigInt(field("total_amount_raised")),
+      statsArePartial: fields["stats_are_partial"]?.b() ?? false,
+    };
   } catch (err) {
     throw new Error(parseContractError(err));
   }
@@ -690,9 +1016,7 @@ export async function getCampaignCount(): Promise<number> {
 export async function getCampaign(id: number): Promise<Campaign | null> {
   if (USE_MOCKS) return MOCK_CAMPAIGNS.find((c) => c.id === id) ?? null;
   try {
-    const result = await invokeViewMethod("get_campaign", [
-      StellarSdk.nativeToScVal(id, { type: "u32" }),
-    ]);
+    const result = await invokeViewMethod("get_campaign", [nativeToScVal(id, { type: "u32" })]);
     if (!result) return null;
     return decodeCampaign(result);
   } catch (err) {
@@ -702,26 +1026,50 @@ export async function getCampaign(id: number): Promise<Campaign | null> {
   }
 }
 
+/**
+ * Loads every campaign by walking `list_campaigns` in LIST_MAX_LIMIT pages
+ * (sequentially) — ceil(N / 50) RPC calls instead of one per campaign.
+ * Prefer `listCampaigns` / `useInfiniteCampaigns` for user-facing lists.
+ */
 export async function getAllCampaigns(): Promise<Campaign[]> {
   if (USE_MOCKS) return [...MOCK_CAMPAIGNS];
-  try {
-    const count = await getCampaignCount();
-    const results = await Promise.all(Array.from({ length: count }, (_, i) => getCampaign(i + 1)));
-    return results.filter((c): c is Campaign => c !== null);
-  } catch (err) {
-    throw new Error(parseContractError(err));
+  const all: Campaign[] = [];
+  let cursor: number | null = 1;
+  while (cursor !== null) {
+    const page: CampaignsPage = await listCampaigns({ cursor, limit: LIST_MAX_LIMIT });
+    all.push(...page.campaigns);
+    cursor = page.nextCursor;
   }
+  return all;
 }
 
 export async function getContribution(campaignId: number, contributor: string): Promise<bigint> {
   if (USE_MOCKS) return BigInt(0);
   try {
     const result = await invokeViewMethod("get_contribution", [
-      StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-      new StellarSdk.Address(contributor).toScVal(),
+      nativeToScVal(campaignId, { type: "u32" }),
+      new Address(contributor).toScVal(),
     ]);
     if (!result) return BigInt(0);
-    return StellarSdk.scValToBigInt(result);
+    return scValToBigInt(result);
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+/**
+ * Fetch the personal contribution cap for a contributor on a specific campaign.
+ * Returns the cap in stroops, or 0 if no cap is set (unlimited).
+ */
+export async function getPersonalCap(campaignId: number, contributor: string): Promise<bigint> {
+  if (USE_MOCKS) return BigInt(0);
+  try {
+    const result = await invokeViewMethod("get_personal_cap", [
+      nativeToScVal(campaignId, { type: "u32" }),
+      new Address(contributor).toScVal(),
+    ]);
+    if (!result) return BigInt(0);
+    return scValToBigInt(result);
   } catch (err) {
     throw new Error(parseContractError(err));
   }
@@ -731,10 +1079,10 @@ export async function getRevenuePool(campaignId: number): Promise<bigint> {
   if (USE_MOCKS) return BigInt(0);
   try {
     const result = await invokeViewMethod("get_revenue_pool", [
-      StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
+      nativeToScVal(campaignId, { type: "u32" }),
     ]);
     if (!result) return BigInt(0);
-    return StellarSdk.scValToBigInt(result);
+    return scValToBigInt(result);
   } catch (err) {
     throw new Error(parseContractError(err));
   }
@@ -744,11 +1092,176 @@ export async function getRevenueClaimed(campaignId: number, contributor: string)
   if (USE_MOCKS) return BigInt(0);
   try {
     const result = await invokeViewMethod("get_revenue_claimed", [
-      StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-      new StellarSdk.Address(contributor).toScVal(),
+      nativeToScVal(campaignId, { type: "u32" }),
+      new Address(contributor).toScVal(),
     ]);
     if (!result) return BigInt(0);
-    return StellarSdk.scValToBigInt(result);
+    return scValToBigInt(result);
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Milestone payout plan (#783 / issue #1672)
+// Mirrors the on-chain Milestone struct: { id, description, payout_bps, verified }
+// ---------------------------------------------------------------------------
+
+export const BPS_DENOMINATOR = 10_000;
+const BPS_CEIL_OFFSET = 9_999;
+
+function decodeMilestone(val: xdr.ScVal): ContractMilestone {
+  const map = val.map();
+  if (!map) throw new Error("Expected ScVal map for Milestone.");
+  const fields: Record<string, xdr.ScVal> = {};
+  for (const entry of map) {
+    const key = entry.key().sym().toString();
+    fields[key] = entry.val();
+  }
+  return {
+    id: fields["id"].u32(),
+    description: fields["description"].str().toString(),
+    payout_bps: fields["payout_bps"].u32(),
+    verified: fields["verified"].b(),
+  };
+}
+
+/**
+ * Fetch the on-chain milestone payout plan for `campaignId`.
+ * Returns an empty array when the creator has not set a plan.
+ */
+export async function getMilestones(campaignId: number): Promise<ContractMilestone[]> {
+  if (USE_MOCKS) return [];
+  try {
+    const result = await invokeViewMethod("get_milestones", [
+      nativeToScVal(campaignId, { type: "u32" }),
+    ]);
+    return result?.vec()?.map(decodeMilestone) ?? [];
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+/**
+ * Whether milestone `milestoneId` of `campaignId` has already claimed its payout.
+ */
+export async function isMilestoneClaimed(
+  campaignId: number,
+  milestoneId: number,
+): Promise<boolean> {
+  if (USE_MOCKS) return false;
+  try {
+    const result = await invokeViewMethod("is_milestone_claimed", [
+      nativeToScVal(campaignId, { type: "u32" }),
+      nativeToScVal(milestoneId, { type: "u32" }),
+    ]);
+    return result?.b() ?? false;
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+/**
+ * What the creator would receive when claiming a milestone of `payoutBps` out
+ * of `amountRaised`, before any dust absorption on the final milestone.
+ * Mirrors the contract's release math (ceil fee, floor claim).
+ */
+export function expectedMilestonePayout(
+  amountRaised: bigint,
+  payoutBps: number,
+  feeBps: number,
+): bigint {
+  const feeTotal =
+    (amountRaised * BigInt(feeBps) + BigInt(BPS_CEIL_OFFSET)) / BigInt(BPS_DENOMINATOR);
+  const totalAfterFee = amountRaised - feeTotal;
+  return (totalAfterFee * BigInt(payoutBps)) / BigInt(BPS_DENOMINATOR);
+}
+
+/**
+ * Admin: mark milestone `milestoneId` of `campaignId` as verified.
+ * Returns the transaction hash on success.
+ */
+export async function verifyMilestone(
+  campaignId: number,
+  milestoneId: number,
+  options?: TransactionLifecycleOptions,
+): Promise<string> {
+  if (USE_MOCKS) return emitMockLifecycle("mock_tx_verify_milestone", options);
+  const callerAddress = await getSignerAddress();
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call(
+    "verify_milestone",
+    nativeToScVal(campaignId, { type: "u32" }),
+    nativeToScVal(milestoneId, { type: "u32" }),
+  );
+  try {
+    const txResult = await buildAndSubmitTransaction(callerAddress, op, {
+      ...options,
+      operation: "verify_milestone",
+    });
+    // The plan's verified flags changed.
+    clearContractCacheByMethod("get_milestones");
+    return txResult.txHash;
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+/**
+ * Creator: claim the already-verified milestone `milestoneId` of `campaignId`.
+ * Returns the transaction hash on success.
+ */
+export async function claimMilestone(
+  campaignId: number,
+  milestoneId: number,
+  options?: TransactionLifecycleOptions,
+): Promise<string> {
+  if (USE_MOCKS) return emitMockLifecycle("mock_tx_claim_milestone", options);
+  const callerAddress = await getSignerAddress();
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call(
+    "claim_milestone",
+    nativeToScVal(campaignId, { type: "u32" }),
+    nativeToScVal(milestoneId, { type: "u32" }),
+  );
+  try {
+    const txResult = await buildAndSubmitTransaction(callerAddress, op, {
+      ...options,
+      operation: "claim_milestone",
+    });
+    // Claimed flag and (on the final claim) campaign status both changed.
+    clearContractCacheByMethod("get_milestones");
+    clearContractCacheByMethod("is_milestone_claimed");
+    clearContractCacheByMethod("get_campaign");
+    return txResult.txHash;
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+export async function extendCampaignDeadline(
+  campaignId: number,
+  additionalDays: number,
+): Promise<string> {
+  if (additionalDays < 1 || additionalDays > 30) throw new Error("additionalDays must be 1..30");
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call(
+    "extend_campaign_deadline",
+    nativeToScVal(campaignId, { type: "u32" }),
+    nativeToScVal(additionalDays, { type: "u64" }),
+  );
+  // Caller must be campaign creator; retrieve from wallet context if needed
+  // For now use a placeholder — the UI layer should pass the connected wallet address via options
+  const caller =
+    typeof window !== "undefined"
+      ? (window as any).__walletPublicKey ||
+        "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+      : "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+  try {
+    const result = await buildAndSubmitTransaction(caller, op, {
+      operation: "extend_campaign_deadline",
+    } as any);
+    return result.txHash;
   } catch (err) {
     throw new Error(parseContractError(err));
   }
@@ -759,7 +1272,7 @@ export async function getAdmin(): Promise<string> {
   try {
     const result = await invokeViewMethod("get_admin");
     if (!result) return "";
-    return StellarSdk.Address.fromScVal(result).toString();
+    return Address.fromScVal(result).toString();
   } catch (err) {
     throw new Error(parseContractError(err));
   }
@@ -810,12 +1323,12 @@ export async function init(
   validateStellarAddress(admin);
   validateStellarAddress(token);
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_init", options);
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
+  const contract = new Contract(CONTRACT_ADDRESS);
   const op = contract.call(
     "init",
-    new StellarSdk.Address(admin).toScVal(),
-    new StellarSdk.Address(token).toScVal(),
-    StellarSdk.nativeToScVal(platformFee, { type: "u32" }),
+    new Address(admin).toScVal(),
+    new Address(token).toScVal(),
+    nativeToScVal(platformFee, { type: "u32" }),
   );
   try {
     const txResult = await buildAndSubmitTransaction(admin, op, { ...options, operation: "init" });
@@ -844,17 +1357,12 @@ export async function createCampaign(
     validateRevenueShare(revenueSharePercentage);
   }
 
-  let finalDescription = description;
-  if (options?.coverImageUrl || (options?.milestones && options.milestones.length > 0)) {
-    const ext = {
-      coverImageUrl: options.coverImageUrl,
-      milestones: options.milestones?.map((m) => ({
-        targetAmount: m.targetAmount.toString(),
-        description: m.description,
-      })),
-    };
-    finalDescription = `${description}\n\n===POH_EXT===\n${JSON.stringify(ext)}`;
-  }
+  // Tags, cover images, and milestones are now stored on-chain as native fields
+  // instead of being embedded in the description blob. This ensures they are
+  // properly validated and accessible through the contract interface.
+  // For backward compatibility, old campaigns with blob data can still be parsed
+  // by decodeCampaign().
+  const finalDescription = description;
 
   if (USE_MOCKS) {
     const txHash = emitMockLifecycle("mock_tx_create_campaign", options);
@@ -882,23 +1390,30 @@ export async function createCampaign(
     );
     return txHash;
   }
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
+
+  await requireExistingCreatorAccount(creator);
+  const contract = new Contract(CONTRACT_ADDRESS);
   const op = contract.call(
     "create_campaign",
-    new StellarSdk.Address(creator).toScVal(),
-    StellarSdk.nativeToScVal(title, { type: "string" }),
-    StellarSdk.nativeToScVal(finalDescription, { type: "string" }),
-    StellarSdk.nativeToScVal(fundingGoal, { type: "i128" }),
-    StellarSdk.nativeToScVal(durationDays, { type: "u64" }),
-    StellarSdk.nativeToScVal(category, { type: "u32" }),
-    StellarSdk.nativeToScVal(hasRevenueSharing, { type: "bool" }),
-    StellarSdk.nativeToScVal(revenueSharePercentage, { type: "u32" }),
+    new Address(creator).toScVal(),
+    nativeToScVal(title, { type: "string" }),
+    nativeToScVal(finalDescription, { type: "string" }),
+    nativeToScVal(fundingGoal, { type: "i128" }),
+    nativeToScVal(durationDays, { type: "u64" }),
+    nativeToScVal(category, { type: "u32" }),
+    nativeToScVal(hasRevenueSharing, { type: "bool" }),
+    nativeToScVal(revenueSharePercentage, { type: "u32" }),
   );
   try {
     const txResult = await buildAndSubmitTransaction(creator, op, {
       ...options,
       operation: "create_campaign",
     });
+
+    // Invalidate campaign count and list cache
+    clearContractCacheByMethod("get_campaign_count");
+    clearContractCacheByMethod("get_campaign");
+
     return txResult.txHash;
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
@@ -906,6 +1421,50 @@ export async function createCampaign(
     captureTransactionError("create_campaign", 0, error, errorCode ? String(errorCode) : undefined);
     throw new Error(parseContractError(err));
   }
+}
+
+/**
+ * Simulate the exact contribution operation and return the assembled
+ * transaction fee. Soroban RPC derives this from CPU, memory, ledger reads and
+ * writes, so callers no longer have to guess with a fixed "gas limit".
+ */
+export async function estimateContributeNetworkFee(
+  campaignId: number,
+  contributor: string,
+  amount: bigint,
+): Promise<bigint> {
+  validateStellarAddress(contributor);
+  validateAmount(amount);
+  if (USE_MOCKS) return 100_000n;
+
+  const cached = await getCachedAccount(contributor);
+  // TransactionBuilder increments its source Account during build. Estimation
+  // must not consume a sequence number from the shared submission cache.
+  const source = new Account(cached.accountId(), cached.sequenceNumber());
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call(
+    "contribute",
+    nativeToScVal(campaignId, { type: "u32" }),
+    new Address(contributor).toScVal(),
+    nativeToScVal(amount, { type: "i128" }),
+  );
+  const transaction = new TransactionBuilder(source, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(op)
+    .setTimeout(300)
+    .build();
+
+  const simulation = await withRpcServer((server) => server.simulateTransaction(transaction));
+  if (rpc.Api.isSimulationError(simulation)) {
+    throw normalizeContractError(simulation, "Unable to estimate transaction fee.");
+  }
+
+  const prepared = rpc
+    .assembleTransaction(transaction, simulation as rpc.Api.SimulateTransactionSuccessResponse)
+    .build();
+  return BigInt(prepared.fee);
 }
 
 export async function contribute(
@@ -918,12 +1477,12 @@ export async function contribute(
   validateAmount(amount);
 
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_contribute", options);
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
+  const contract = new Contract(CONTRACT_ADDRESS);
   const op = contract.call(
     "contribute",
-    StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-    new StellarSdk.Address(contributor).toScVal(),
-    StellarSdk.nativeToScVal(amount, { type: "i128" }),
+    nativeToScVal(campaignId, { type: "u32" }),
+    new Address(contributor).toScVal(),
+    nativeToScVal(amount, { type: "i128" }),
   );
   try {
     const txResult = await buildAndSubmitTransaction(contributor, op, {
@@ -936,6 +1495,11 @@ export async function contribute(
       action: "contribute",
       txHash: txResult.txHash,
     });
+
+    // Invalidate cache for this campaign and contribution
+    clearContractCacheByMethod("get_campaign");
+    clearContractCacheByMethod("get_contribution");
+
     return txResult.txHash;
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
@@ -956,8 +1520,8 @@ export async function withdrawFunds(
 ): Promise<string> {
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_withdraw_funds", options);
   const callerAddress = await getSignerAddress();
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
-  const op = contract.call("withdraw_funds", StellarSdk.nativeToScVal(campaignId, { type: "u32" }));
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call("withdraw_funds", nativeToScVal(campaignId, { type: "u32" }));
   try {
     const txResult = await buildAndSubmitTransaction(callerAddress, op, {
       ...options,
@@ -969,6 +1533,10 @@ export async function withdrawFunds(
       action: "withdraw",
       txHash: txResult.txHash,
     });
+
+    // Invalidate campaign cache as status changes after withdrawal
+    clearContractCacheByMethod("get_campaign");
+
     return txResult.txHash;
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err));
@@ -993,11 +1561,8 @@ export async function cancelCampaign(
 ): Promise<string> {
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_cancel_campaign", options);
   const callerAddress = await getSignerAddress();
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
-  const op = contract.call(
-    "cancel_campaign",
-    StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-  );
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call("cancel_campaign", nativeToScVal(campaignId, { type: "u32" }));
   try {
     const txResult = await buildAndSubmitTransaction(callerAddress, op, {
       ...options,
@@ -1028,11 +1593,11 @@ export async function claimRefund(
 ): Promise<string> {
   validateStellarAddress(contributor);
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_claim_refund", options);
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
+  const contract = new Contract(CONTRACT_ADDRESS);
   const op = contract.call(
     "claim_refund",
-    StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-    new StellarSdk.Address(contributor).toScVal(),
+    nativeToScVal(campaignId, { type: "u32" }),
+    new Address(contributor).toScVal(),
   );
   try {
     const txResult = await buildAndSubmitTransaction(contributor, op, {
@@ -1067,11 +1632,11 @@ export async function depositRevenue(
   validateAmount(amount);
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_deposit_revenue", options);
   const callerAddress = await getSignerAddress();
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
+  const contract = new Contract(CONTRACT_ADDRESS);
   const op = contract.call(
     "deposit_revenue",
-    StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-    StellarSdk.nativeToScVal(amount, { type: "i128" }),
+    nativeToScVal(campaignId, { type: "u32" }),
+    nativeToScVal(amount, { type: "i128" }),
   );
   try {
     const txResult = await buildAndSubmitTransaction(callerAddress, op, {
@@ -1091,11 +1656,11 @@ export async function claimRevenue(
 ): Promise<string> {
   validateStellarAddress(contributor);
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_claim_revenue", options);
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
+  const contract = new Contract(CONTRACT_ADDRESS);
   const op = contract.call(
     "claim_revenue",
-    StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-    new StellarSdk.Address(contributor).toScVal(),
+    nativeToScVal(campaignId, { type: "u32" }),
+    new Address(contributor).toScVal(),
   );
   try {
     const txResult = await buildAndSubmitTransaction(contributor, op, {
@@ -1114,17 +1679,197 @@ export async function claimRevenue(
   }
 }
 
+/**
+ * Creator withdraws their retained share of the revenue pool. The contract
+ * rejects with NoFundsToWithdraw once the entitlement is fully claimed.
+ */
+export async function claimCreatorRevenue(
+  campaignId: number,
+  creator: string,
+  options?: TransactionLifecycleOptions,
+): Promise<string> {
+  validateStellarAddress(creator);
+  if (USE_MOCKS) return emitMockLifecycle("mock_tx_claim_creator_revenue", options);
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call("claim_creator_revenue", nativeToScVal(campaignId, { type: "u32" }));
+  try {
+    const txResult = await buildAndSubmitTransaction(creator, op, {
+      ...options,
+      operation: "claim_creator_revenue",
+    });
+    clearContractCacheByMethod("get_revenue_pool");
+    clearContractCacheByMethod("get_revenue_claimed");
+    appendWalletTransaction({
+      walletAddress: creator,
+      campaignId,
+      action: "claim_revenue",
+      txHash: txResult.txHash,
+    });
+    return txResult.txHash;
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// On-chain bookmarks (issue #1674)
+// ---------------------------------------------------------------------------
+
+/** Contract limit (MAX_BOOKMARKS_PER_WALLET) on a wallet's saved list. */
+export const MAX_BOOKMARKS_PER_WALLET = 10;
+
+const mockBookmarks = new Map<string, number[]>();
+
+function clearBookmarkCache(): void {
+  clearContractCacheByMethod("get_saved_campaigns");
+  clearContractCacheByMethod("get_saved_campaigns_count");
+}
+
+async function submitBookmarkTx(
+  user: string,
+  method: string,
+  args: xdr.ScVal[],
+  options?: TransactionLifecycleOptions,
+): Promise<string> {
+  const contract = new Contract(CONTRACT_ADDRESS);
+  try {
+    const txResult = await buildAndSubmitTransaction(user, contract.call(method, ...args), {
+      ...options,
+      operation: method,
+    });
+    clearBookmarkCache();
+    return txResult.txHash;
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+/** Campaign ids the wallet has saved (the contract already drops cancelled campaigns). */
+export async function getSavedCampaigns(user: string): Promise<number[]> {
+  if (USE_MOCKS) return [...(mockBookmarks.get(user) ?? [])];
+  try {
+    const result = await invokeViewMethod("get_saved_campaigns", [new Address(user).toScVal()]);
+    return (result?.vec() ?? []).map((v) => v.u32());
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+export async function getSavedCampaignsCount(user: string): Promise<number> {
+  if (USE_MOCKS) return (mockBookmarks.get(user) ?? []).length;
+  try {
+    const result = await invokeViewMethod("get_saved_campaigns_count", [
+      new Address(user).toScVal(),
+    ]);
+    return result ? result.u32() : 0;
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+export async function saveCampaign(
+  user: string,
+  campaignId: number,
+  options?: TransactionLifecycleOptions,
+): Promise<string> {
+  validateStellarAddress(user);
+  if (USE_MOCKS) {
+    const saved = mockBookmarks.get(user) ?? [];
+    if (saved.includes(campaignId))
+      throw new Error(
+        parseContractError(new ContractErrorException(ContractError.CampaignAlreadyBookmarked)),
+      );
+    if (saved.length >= MAX_BOOKMARKS_PER_WALLET)
+      throw new Error(
+        parseContractError(new ContractErrorException(ContractError.BookmarkLimitReached)),
+      );
+    mockBookmarks.set(user, [...saved, campaignId]);
+    return emitMockLifecycle("mock_tx_save_campaign", options);
+  }
+  return submitBookmarkTx(
+    user,
+    "save_campaign",
+    [new Address(user).toScVal(), nativeToScVal(campaignId, { type: "u32" })],
+    options,
+  );
+}
+
+/** Saves many campaigns atomically in one transaction (used for local → wallet migration). */
+export async function batchSaveCampaigns(
+  user: string,
+  campaignIds: number[],
+  options?: TransactionLifecycleOptions,
+): Promise<string> {
+  validateStellarAddress(user);
+  if (USE_MOCKS) {
+    const saved = mockBookmarks.get(user) ?? [];
+    const merged = [...saved];
+    for (const id of campaignIds) {
+      if (merged.includes(id))
+        throw new Error(
+          parseContractError(new ContractErrorException(ContractError.CampaignAlreadyBookmarked)),
+        );
+      if (merged.length >= MAX_BOOKMARKS_PER_WALLET)
+        throw new Error(
+          parseContractError(new ContractErrorException(ContractError.BookmarkLimitReached)),
+        );
+      merged.push(id);
+    }
+    mockBookmarks.set(user, merged);
+    return emitMockLifecycle("mock_tx_batch_save_campaigns", options);
+  }
+  return submitBookmarkTx(
+    user,
+    "batch_save_campaigns",
+    [
+      new Address(user).toScVal(),
+      xdr.ScVal.scvVec(campaignIds.map((id) => nativeToScVal(id, { type: "u32" }))),
+    ],
+    options,
+  );
+}
+
+export async function removeSavedCampaign(
+  user: string,
+  campaignId: number,
+  options?: TransactionLifecycleOptions,
+): Promise<string> {
+  validateStellarAddress(user);
+  if (USE_MOCKS) {
+    mockBookmarks.set(
+      user,
+      (mockBookmarks.get(user) ?? []).filter((id) => id !== campaignId),
+    );
+    return emitMockLifecycle("mock_tx_remove_saved_campaign", options);
+  }
+  return submitBookmarkTx(
+    user,
+    "remove_saved_campaign",
+    [new Address(user).toScVal(), nativeToScVal(campaignId, { type: "u32" })],
+    options,
+  );
+}
+
+export async function clearSavedCampaigns(
+  user: string,
+  options?: TransactionLifecycleOptions,
+): Promise<string> {
+  validateStellarAddress(user);
+  if (USE_MOCKS) {
+    mockBookmarks.set(user, []);
+    return emitMockLifecycle("mock_tx_clear_saved_campaigns", options);
+  }
+  return submitBookmarkTx(user, "clear_saved_campaigns", [new Address(user).toScVal()], options);
+}
+
 export async function verifyCampaign(
   campaignId: number,
   options?: TransactionLifecycleOptions,
 ): Promise<string> {
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_verify_campaign", options);
   const callerAddress = await getSignerAddress();
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
-  const op = contract.call(
-    "verify_campaign",
-    StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-  );
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call("verify_campaign", nativeToScVal(campaignId, { type: "u32" }));
   try {
     const txResult = await buildAndSubmitTransaction(callerAddress, op, {
       ...options,
@@ -1146,11 +1891,8 @@ export async function updatePlatformFee(
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_update_platform_fee", options);
 
   const callerAddress = await getSignerAddress();
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
-  const op = contract.call(
-    "update_platform_fee",
-    StellarSdk.nativeToScVal(platformFee, { type: "u32" }),
-  );
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call("update_platform_fee", nativeToScVal(platformFee, { type: "u32" }));
 
   try {
     const txResult = await buildAndSubmitTransaction(callerAddress, op, {
@@ -1174,8 +1916,8 @@ export async function updateAdmin(
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_update_admin", options);
 
   const callerAddress = await getSignerAddress();
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
-  const op = contract.call("update_admin", new StellarSdk.Address(newAdmin).toScVal());
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call("update_admin", new Address(newAdmin).toScVal());
 
   try {
     const txResult = await buildAndSubmitTransaction(callerAddress, op, {
@@ -1196,7 +1938,7 @@ export async function getApproveVotes(campaignId: number): Promise<number> {
   if (USE_MOCKS) return 0;
   try {
     const result = await invokeViewMethod("get_approve_votes", [
-      StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
+      nativeToScVal(campaignId, { type: "u32" }),
     ]);
     if (!result) return 0;
     return result.u32();
@@ -1209,7 +1951,7 @@ export async function getRejectVotes(campaignId: number): Promise<number> {
   if (USE_MOCKS) return 0;
   try {
     const result = await invokeViewMethod("get_reject_votes", [
-      StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
+      nativeToScVal(campaignId, { type: "u32" }),
     ]);
     if (!result) return 0;
     return result.u32();
@@ -1222,8 +1964,8 @@ export async function hasVoted(campaignId: number, voter: string): Promise<boole
   if (USE_MOCKS) return false;
   try {
     const result = await invokeViewMethod("has_voted", [
-      StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-      new StellarSdk.Address(voter).toScVal(),
+      nativeToScVal(campaignId, { type: "u32" }),
+      new Address(voter).toScVal(),
     ]);
     if (!result) return false;
     return result.b();
@@ -1255,6 +1997,73 @@ export async function getApprovalThresholdBps(): Promise<number> {
 }
 
 /**
+ * Whether an off-chain comment has been censured on-chain (#1682).
+ *
+ * The contract stores censure records keyed by an opaque 32-byte comment hash;
+ * the frontend computes that hash with `hashComment` in `./commentHash`.
+ * Unknown hashes read as not censured.
+ */
+export async function isCommentCensured(campaignId: number, commentHash: string): Promise<boolean> {
+  if (USE_MOCKS) return false;
+  try {
+    const result = await invokeViewMethod("is_comment_censured", [
+      nativeToScVal(campaignId, { type: "u32" }),
+      xdr.ScVal.scvBytes(Buffer.from(commentHash, "hex")),
+    ]);
+    if (!result) return false;
+    return result.b();
+  } catch (err) {
+    throw new Error(parseContractError(err));
+  }
+}
+
+/**
+ * Set or update a personal contribution cap for a campaign.
+ * Pass BigInt(0) to remove the cap (unlimited).
+ * Returns the transaction hash on success.
+ */
+export async function setPersonalCap(
+  campaignId: number,
+  contributor: string,
+  capAmount: bigint,
+  options?: TransactionLifecycleOptions,
+): Promise<string> {
+  validateStellarAddress(contributor);
+
+  if (USE_MOCKS) return emitMockLifecycle("mock_tx_set_personal_cap", options);
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call(
+    "set_personal_cap",
+    nativeToScVal(campaignId, { type: "u32" }),
+    new Address(contributor).toScVal(),
+    nativeToScVal(capAmount, { type: "i128" }),
+  );
+  try {
+    const txResult = await buildAndSubmitTransaction(contributor, op, {
+      ...options,
+      operation: "set_personal_cap",
+    });
+    appendWalletTransaction({
+      walletAddress: contributor,
+      campaignId,
+      action: "set_personal_cap",
+      txHash: txResult.txHash,
+    });
+    return txResult.txHash;
+  } catch (err) {
+    const error = err instanceof Error ? err : new Error(String(err));
+    const errorCode = getContractErrorCode(err);
+    captureTransactionError(
+      "set_personal_cap",
+      campaignId,
+      error,
+      errorCode ? String(errorCode) : undefined,
+    );
+    throw new Error(parseContractError(err));
+  }
+}
+
+/**
  * Cast a vote on a campaign via Freighter wallet.
  * approve = true → upvote, approve = false → downvote.
  */
@@ -1270,12 +2079,12 @@ export async function voteOnCampaign(
       options,
     );
   }
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
+  const contract = new Contract(CONTRACT_ADDRESS);
   const op = contract.call(
     "vote_on_campaign",
-    StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
-    new StellarSdk.Address(voter).toScVal(),
-    StellarSdk.nativeToScVal(approve, { type: "bool" }),
+    nativeToScVal(campaignId, { type: "u32" }),
+    new Address(voter).toScVal(),
+    nativeToScVal(approve, { type: "bool" }),
   );
   try {
     const txResult = await buildAndSubmitTransaction(voter, op, {
@@ -1312,10 +2121,10 @@ export async function verifyCampaignWithVotes(
 ): Promise<string> {
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_verify_with_votes", options);
   const callerAddress = await getSignerAddress();
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
+  const contract = new Contract(CONTRACT_ADDRESS);
   const op = contract.call(
     "verify_campaign_with_votes",
-    StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
+    nativeToScVal(campaignId, { type: "u32" }),
   );
   try {
     const txResult = await buildAndSubmitTransaction(callerAddress, op, {
@@ -1352,7 +2161,7 @@ export async function getCampaignReserve(campaignId: number): Promise<CampaignRe
   if (USE_MOCKS) return null;
   try {
     const result = await invokeViewMethod("get_campaign_reserve", [
-      StellarSdk.nativeToScVal(campaignId, { type: "u32" }),
+      nativeToScVal(campaignId, { type: "u32" }),
     ]);
     if (!result) return null;
 
@@ -1371,10 +2180,10 @@ export async function getCampaignReserve(campaignId: number): Promise<CampaignRe
       const key = entry.key().sym();
       switch (key) {
         case "amount":
-          amount = StellarSdk.scValToBigInt(entry.val());
+          amount = scValToBigInt(entry.val());
           break;
         case "release_timestamp":
-          release_timestamp = Number(StellarSdk.scValToBigInt(entry.val()));
+          release_timestamp = Number(scValToBigInt(entry.val()));
           break;
         case "released":
           released = entry.val().b() ?? false;
@@ -1398,8 +2207,8 @@ export async function claimReserve(
 ): Promise<string> {
   if (USE_MOCKS) return emitMockLifecycle("mock_tx_claim_reserve", options);
   const callerAddress = await getSignerAddress();
-  const contract = new StellarSdk.Contract(CONTRACT_ADDRESS);
-  const op = contract.call("claim_reserve", StellarSdk.nativeToScVal(campaignId, { type: "u32" }));
+  const contract = new Contract(CONTRACT_ADDRESS);
+  const op = contract.call("withdraw_reserve", nativeToScVal(campaignId, { type: "u32" }));
   try {
     const txResult = await buildAndSubmitTransaction(callerAddress, op, {
       ...options,

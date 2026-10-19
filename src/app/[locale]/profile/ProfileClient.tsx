@@ -11,8 +11,8 @@ import { useSavedCampaigns } from "@/hooks/useSavedCampaigns";
 import { formatAddress } from "@/lib/formatAddress";
 import { formatAmount } from "@/lib/formatters";
 import { isSameAddress } from "@/lib/stellar";
-import MyContributionsSection from "@/components/MyContributionsSection";
 import { Skeleton } from "@/components/Skeleton";
+import CreatorProfileHeader from "@/components/CreatorProfileHeader";
 
 export default function ProfileClient() {
   const t = useTranslations("Profile");
@@ -20,7 +20,7 @@ export default function ProfileClient() {
   const { publicKey, isWalletConnected, connectWallet, isLoading: walletLoading } = useWallet();
   const { campaigns, isLoading: campaignsLoading } = useCampaigns();
   const { contributions, isLoading: contributionsLoading } = useContributions(publicKey);
-  const { savedIds } = useSavedCampaigns();
+  const { savedIds, localBookmarks, syncLocalBookmarks, isSyncing } = useSavedCampaigns();
 
   const savedCampaigns = useMemo(
     () => campaigns.filter((c) => savedIds.includes(c.id)),
@@ -66,62 +66,116 @@ export default function ProfileClient() {
 
   return (
     <div className="max-w-4xl mx-auto px-4 py-10">
-      {/* Profile header */}
-      <div className="rounded-3xl bg-linear-to-br from-zinc-900 to-zinc-800 dark:from-zinc-800 dark:to-zinc-900 border border-zinc-700 p-8 mb-8 shadow-xl">
-        <div className="flex flex-col sm:flex-row sm:items-center gap-6">
-          <div className="w-16 h-16 shrink-0 rounded-full bg-linear-to-br from-red-400 to-pink-600 flex items-center justify-center text-white font-black text-xl shadow-lg">
-            {publicKey.slice(1, 3).toUpperCase()}
-          </div>
-          <div className="flex-1 min-w-0">
-            <p className="text-xs font-bold uppercase tracking-widest text-zinc-400 mb-1">
-              {t("walletAddress")}
-            </p>
-            <p className="font-mono text-zinc-100 text-sm break-all" title={publicKey}>
-              {publicKey}
-            </p>
-          </div>
-        </div>
-
+      <CreatorProfileHeader
+        key={publicKey}
+        address={publicKey}
+        verifiedCampaignCount={createdCampaigns.filter((campaign) => campaign.is_verified).length}
+      >
         {/* Impact stats */}
-        <div className="grid grid-cols-3 gap-4 mt-8 pt-8 border-t border-zinc-700">
+        <div className="grid grid-cols-3 gap-4 mt-8 pt-8 border-t border-zinc-200 dark:border-zinc-700">
           <div className="text-center">
             {isDataLoading ? (
               <Skeleton className="h-7 w-24 mx-auto mb-1" />
             ) : (
-              <p className="text-2xl font-black text-white">
+              <p className="break-words text-xl font-bold text-zinc-900 dark:text-zinc-50 sm:text-2xl">
                 {formatAmount(totalContributed, locale, { maximumFractionDigits: 2 })}
-                <span className="text-sm font-bold text-zinc-400 ml-1">XLM</span>
+                <span className="text-sm font-bold text-zinc-600 dark:text-zinc-300 ml-1">XLM</span>
               </p>
             )}
-            <p className="text-xs text-zinc-400 font-medium mt-1">{t("totalContributed")}</p>
+            <p className="text-xs text-zinc-600 dark:text-zinc-300 font-medium mt-1">
+              {t("totalContributed")}
+            </p>
           </div>
           <div className="text-center">
             {isDataLoading ? (
               <Skeleton className="h-7 w-12 mx-auto mb-1" />
             ) : (
-              <p className="text-2xl font-black text-white">{contributions.length}</p>
+              <p className="break-words text-xl font-bold text-zinc-900 dark:text-zinc-50 sm:text-2xl">
+                {contributions.length}
+              </p>
             )}
-            <p className="text-xs text-zinc-400 font-medium mt-1">{t("campaignsBacked")}</p>
+            <p className="text-xs text-zinc-600 dark:text-zinc-300 font-medium mt-1">
+              {t("campaignsBacked")}
+            </p>
           </div>
           <div className="text-center">
             {isDataLoading ? (
               <Skeleton className="h-7 w-12 mx-auto mb-1" />
             ) : (
-              <p className="text-2xl font-black text-white">{createdCampaigns.length}</p>
+              <p className="break-words text-xl font-bold text-zinc-900 dark:text-zinc-50 sm:text-2xl">
+                {createdCampaigns.length}
+              </p>
             )}
-            <p className="text-xs text-zinc-400 font-medium mt-1">{t("campaignsCreated")}</p>
+            <p className="text-xs text-zinc-600 dark:text-zinc-300 font-medium mt-1">
+              {t("campaignsCreated")}
+            </p>
           </div>
         </div>
-      </div>
+      </CreatorProfileHeader>
 
       {/* Contributions */}
-      <MyContributionsSection walletAddress={publicKey} />
+      {(isDataLoading || contributions.length > 0) && (
+        <section className="mb-8">
+          <h2 className="text-xl font-bold text-zinc-900 dark:text-zinc-50 mb-4">
+            {t("campaignsBacked")}
+          </h2>
+          {isDataLoading ? (
+            <Skeleton className="h-20 rounded-2xl" />
+          ) : (
+            <ul className="space-y-3">
+              {contributions.map((item, index) => {
+                const campaign = item.campaign;
+                return (
+                  <li key={`${campaign.id}-${index}`}>
+                    <Link
+                      href={`/causes/${campaign.id}`}
+                      className="group flex items-center justify-between gap-4 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 hover:border-red-200 dark:hover:border-red-900/40 hover:shadow-md transition-all"
+                    >
+                      <div className="min-w-0">
+                        <p className="font-semibold text-zinc-900 dark:text-zinc-50 group-hover:text-red-600 dark:group-hover:text-red-400 transition-colors line-clamp-1">
+                          {campaign.title}
+                        </p>
+                        <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-1 font-medium">
+                          {formatAddress(campaign.creator)}
+                        </p>
+                      </div>
+                      <span className="shrink-0 text-sm font-bold text-zinc-900 dark:text-zinc-50">
+                        {formatAmount(item.contribution, locale, { maximumFractionDigits: 2 })}
+                        <span className="text-xs font-semibold text-zinc-400 ml-1">XLM</span>
+                      </span>
+                    </Link>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </section>
+      )}
 
       {/* Saved campaigns */}
       <section className="mb-8">
         <h2 className="text-xl font-bold text-zinc-900 dark:text-zinc-50 mb-4">
           {t("savedCampaigns")}
         </h2>
+        {localBookmarks.length > 0 && (
+          <div className="mb-4 flex flex-col gap-3 rounded-2xl border border-blue-200 bg-blue-50 p-4 text-sm dark:border-blue-900/50 dark:bg-blue-950/30 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-blue-900 dark:text-blue-200">
+              You have {localBookmarks.length} bookmark{localBookmarks.length === 1 ? "" : "s"}{" "}
+              saved only in this browser. Move them to your wallet so they follow you across
+              devices.
+            </p>
+            <button
+              type="button"
+              onClick={syncLocalBookmarks}
+              disabled={isSyncing}
+              className="shrink-0 rounded-full bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-zinc-400"
+            >
+              {isSyncing
+                ? "Syncing..."
+                : `Sync ${localBookmarks.length} local bookmark${localBookmarks.length === 1 ? "" : "s"} to your wallet`}
+            </button>
+          </div>
+        )}
         {campaignsLoading ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             {[0, 1].map((i) => (
@@ -144,7 +198,7 @@ export default function ProfileClient() {
               <Link
                 key={campaign.id}
                 href={`/causes/${campaign.id}`}
-                className="group rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 hover:border-red-200 dark:hover:border-red-900/40 hover:shadow-md transition-all"
+                className="group rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 hover:border-red-200 dark:hover:border-red-900/40 hover:shadow-md transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-zinc-800"
               >
                 <p className="font-semibold text-zinc-900 dark:text-zinc-50 group-hover:text-red-600 dark:group-hover:text-red-400 transition-colors line-clamp-1">
                   {campaign.title}
@@ -175,7 +229,7 @@ export default function ProfileClient() {
                 <li key={campaign.id}>
                   <Link
                     href={`/causes/${campaign.id}`}
-                    className="group flex items-center justify-between gap-4 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 hover:border-red-200 dark:hover:border-red-900/40 hover:shadow-md transition-all"
+                    className="group flex items-center justify-between gap-4 rounded-2xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-5 hover:border-red-200 dark:hover:border-red-900/40 hover:shadow-md transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-zinc-800"
                   >
                     <div className="min-w-0">
                       <p className="font-semibold text-zinc-900 dark:text-zinc-50 group-hover:text-red-600 dark:group-hover:text-red-400 transition-colors line-clamp-1">

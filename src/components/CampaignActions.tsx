@@ -161,7 +161,7 @@ export default function CampaignActions({ campaign, onActionSuccess }: CampaignA
         </p>
         <button
           onClick={connectWallet}
-          className="w-full py-3 min-h-[44px] bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-full transition-colors"
+          className="fixed bottom-4 left-4 right-4 z-50 sm:static sm:w-full py-3 min-h-[44px] bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-full transition-colors"
         >
           Connect Wallet to Contribute
         </button>
@@ -194,8 +194,14 @@ export default function CampaignActions({ campaign, onActionSuccess }: CampaignA
                 min="0"
                 step="0.1"
                 inputMode="decimal"
+                enterKeyHint="done"
                 value={contributionAmount}
                 onChange={(e) => setContributionAmount(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.currentTarget.blur();
+                  }
+                }}
                 placeholder="Amount in XLM"
                 disabled={isPending("contribute", campaign.id) || !!contributionDisabledReason}
                 aria-describedby="contribution-amount-hint"
@@ -204,7 +210,7 @@ export default function CampaignActions({ campaign, onActionSuccess }: CampaignA
               <button
                 onClick={handleContribute}
                 disabled={isPending("contribute", campaign.id) || !!contributionDisabledReason}
-                className="rounded-lg bg-blue-600 px-4 py-2.5 font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-zinc-400 flex items-center gap-2"
+                className="fixed bottom-4 left-4 right-4 z-50 justify-center sm:static rounded-lg bg-blue-600 px-4 py-2.5 font-medium text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:bg-zinc-400 flex items-center gap-2"
               >
                 <AsyncButtonContent
                   isPending={isPending("contribute", campaign.id)}
@@ -268,8 +274,15 @@ export default function CampaignActions({ campaign, onActionSuccess }: CampaignA
                         type="number"
                         min="0"
                         step="any"
+                        inputMode="decimal"
+                        enterKeyHint="done"
                         value={revenueAmount}
                         onChange={(e) => setRevenueAmount(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.currentTarget.blur();
+                          }
+                        }}
                         placeholder="Amount in XLM"
                         className="w-full px-4 py-3 pr-16 rounded-lg border border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-700 text-zinc-900 dark:text-zinc-50 focus:outline-none focus:ring-2 focus:ring-purple-500 text-sm"
                       />

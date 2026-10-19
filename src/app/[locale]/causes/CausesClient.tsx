@@ -4,7 +4,7 @@ import dynamic from "next/dynamic";
 import { useSearchParams } from "next/navigation";
 import { Search } from "lucide-react";
 import { useTranslations } from "next-intl";
-import { useState, useEffect, useCallback, useMemo, Suspense } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, Suspense } from "react";
 import { MapIcon, ListIcon } from "lucide-react";
 import { CauseCardSkeleton } from "@/components/Skeleton";
 import MapErrorBoundary from "@/components/MapErrorBoundary";
@@ -104,6 +104,15 @@ function CausesContent() {
   const [tag, setTag] = useState(searchParams.get("tag") ?? "");
   const [viewMode, setViewMode] = useState<"list" | "map">("list");
 
+  // Keep state in sync with URL parameters when navigating back / forward
+  useEffect(() => {
+    setRawSearch(searchParams.get("q") ?? "");
+    setCategory(searchParams.get("category") ?? "all");
+    setStatus(searchParams.get("status") ?? "all");
+    setSort(searchParams.get("sort") ?? "newest");
+    setTag(searchParams.get("tag") ?? "");
+  }, [searchParams]);
+
   const debouncedSearch = useDebounce(rawSearch, 300);
 
   const STATUS_OPTIONS: ("all" | CampaignStatus)[] = [
@@ -133,11 +142,31 @@ function CausesContent() {
   const [mounted, setMounted] = useState(false);
   const { publicKey: userWalletAddress } = useWallet();
   const { showError, showSuccess, showWarning } = useToast();
+  const resultsRef = useRef<HTMLDivElement>(null);
+  const isFirstFilterRun = useRef(true);
+  /**
+   * Tracks which campaign IDs have already had their vote counts fetched so
+   * that each new page load only requests counts for the *new* campaigns
+   * rather than re-fetching the entire accumulated list (issue #1150).
+   */
+  const fetchedVoteIds = useRef<Set<number>>(new Set());
 
   // Set mounted after hydration to guard SSR-sensitive rendering
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  // Scroll back to the top of the results whenever a search/filter changes
+  // (issue #1107) — otherwise a shrunk result set can leave the page scrolled
+  // past its own content, and the visible page ends up "stuck" wherever the
+  // user last scrolled to under the previous filter.
+  useEffect(() => {
+    if (isFirstFilterRun.current) {
+      isFirstFilterRun.current = false;
+      return;
+    }
+    resultsRef.current?.scrollIntoView?.({ block: "start" });
+  }, [debouncedSearch, category, status, sort, tag]);
 
   // Mirror contract data into local state so optimistic updates work
   useEffect(() => {
@@ -194,9 +223,16 @@ function CausesContent() {
   }, [userWalletAddress, campaigns]);
 
   const loadVoteCounts = useCallback(async () => {
+    // Only fetch vote counts for campaigns that haven't been fetched yet
+    // (issue #1150): re-fetching ALL campaigns on every new page load caused
+    // O(total×2) RPC calls per page — e.g. page 40 of 500 campaigns fired
+    // 1 000 requests even though pages 1-39 were already counted.
+    const newCampaigns = campaigns.filter((c) => !fetchedVoteIds.current.has(c.id));
+    if (newCampaigns.length === 0) return;
+
     const counts: Record<number, { upvotes: number; downvotes: number; totalVotes: number }> = {};
     await Promise.all(
-      campaigns.map(async (campaign) => {
+      newCampaigns.map(async (campaign) => {
         try {
           const [approves, rejects] = await Promise.all([
             getApproveVotes(campaign.id),
@@ -210,9 +246,11 @@ function CausesContent() {
         } catch {
           counts[campaign.id] = { upvotes: 0, downvotes: 0, totalVotes: 0 };
         }
+        fetchedVoteIds.current.add(campaign.id);
       }),
     );
-    setVoteCounts(counts);
+    // Merge new counts into existing state instead of replacing the whole map
+    setVoteCounts((prev) => ({ ...prev, ...counts }));
   }, [campaigns]);
 
   useEffect(() => {
@@ -225,6 +263,9 @@ function CausesContent() {
       loadVoteCounts();
       return;
     }
+    // Reset the seen-IDs tracker when the list is cleared so a fresh fetch
+    // will re-request counts if campaigns reload (e.g. after a refetch).
+    fetchedVoteIds.current = new Set();
     setVoteCounts({});
   }, [campaigns, loadVoteCounts]);
 
@@ -429,6 +470,12 @@ function CausesContent() {
   const hasActiveFilters =
     debouncedSearch || category !== "all" || status !== "all" || sort !== "newest" || tag;
 
+  const suggestedCategories = CATEGORY_VALUES.filter(
+    (cat) => categoryCounts[cat] > 0 && String(cat) !== category,
+  )
+    .sort((a, b) => categoryCounts[b] - categoryCounts[a])
+    .slice(0, 3);
+
   const clearFilters = () => {
     setRawSearch("");
     setCategory("all");
@@ -437,12 +484,64 @@ function CausesContent() {
     setTag("");
   };
 
+  const renderEmptyState = () => (
+    <div className="text-center py-20">
+      <div className="text-5xl mb-4">
+        {campaigns.length === 0 ? "📭" : debouncedSearch ? "🔍" : "🔎"}
+      </div>
+      <h2 className="text-xl font-semibold text-zinc-900 dark:text-zinc-50 mb-2">
+        {campaigns.length === 0
+          ? t("noCausesYet")
+          : debouncedSearch
+            ? t("noSearchResults")
+            : t("noCausesFound")}
+      </h2>
+      <p className="text-zinc-600 dark:text-zinc-400 mb-6">
+        {campaigns.length === 0
+          ? t("beFirstToSubmit")
+          : debouncedSearch
+            ? t("tryDifferentSearch")
+            : t("tryDifferentKeyword")}
+      </p>
+      {campaigns.length > 0 && hasActiveFilters && suggestedCategories.length > 0 && (
+        <div className="flex flex-wrap items-center justify-center gap-2 mb-6">
+          <span className="text-sm text-zinc-500 dark:text-zinc-400">
+            Try one of these categories:
+          </span>
+          {suggestedCategories.map((cat) => (
+            <button
+              key={cat}
+              type="button"
+              onClick={() => setCategory(String(cat))}
+              className="inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full text-sm font-medium bg-zinc-100 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-600"
+            >
+              <span aria-hidden="true">
+                {CATEGORY_ICONS[cat]} {CATEGORY_LABELS[cat]}
+              </span>
+              <span aria-hidden="true" className="tabular-nums text-xs font-semibold px-1.5 py-0.5 rounded-full bg-zinc-200 dark:bg-zinc-600 text-zinc-600 dark:text-zinc-300">
+                {categoryCounts[cat]}
+              </span>
+            </button>
+          ))}
+        </div>
+      )}
+      {campaigns.length > 0 && (
+        <button
+          onClick={clearFilters}
+          className="px-6 py-2 bg-blue-600 text-white rounded-full text-sm font-medium hover:bg-blue-700 transition-colors"
+        >
+          {t("clearAllFilters")}
+        </button>
+      )}
+    </div>
+  );
+
   // -------------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------------
 
   return (
-    <div className="min-h-screen bg-linear-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-800">
+    <div className="min-h-full bg-linear-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-800">
       <main className="container mx-auto px-4 py-8">
         {/* Page heading */}
         <div className="mb-6">
@@ -564,25 +663,37 @@ function CausesContent() {
               </select>
             </div>
 
-            <div className="flex items-center gap-2">
-              <label
-                htmlFor="causes-sort-select"
-                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 whitespace-nowrap w-16 sm:w-auto"
+            <div className="flex items-center gap-2 flex-wrap">
+              <span
+                id="causes-sort-label"
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 whitespace-nowrap"
               >
                 {t("labelSortBy")}
-              </label>
-              <select
-                id="causes-sort-select"
-                value={sort}
-                onChange={(e) => setSort(e.target.value)}
-                className="flex-1 sm:flex-none text-sm rounded-lg border border-zinc-200 dark:border-zinc-600 bg-zinc-50 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-50 px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              </span>
+              <div
+                role="group"
+                aria-labelledby="causes-sort-label"
+                className="flex flex-wrap gap-1.5"
               >
-                {SORT_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
+                {SORT_OPTIONS.map((o) => {
+                  const selected = sort === o.value;
+                  return (
+                    <button
+                      key={o.value}
+                      type="button"
+                      aria-pressed={selected}
+                      onClick={() => setSort(o.value)}
+                      className={`px-3 py-1.5 rounded-full text-xs font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-zinc-800 ${
+                        selected
+                          ? "bg-blue-600 text-white"
+                          : "bg-zinc-100 dark:bg-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-200 dark:hover:bg-zinc-600"
+                      }`}
+                    >
+                      {o.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
             {hasActiveFilters && (
@@ -650,7 +761,7 @@ function CausesContent() {
 
         {/* Results */}
         {!isLoading && !error && mounted && (
-          <>
+          <div ref={resultsRef}>
             {/* List view */}
             {viewMode === "list" && (
               <>
@@ -690,44 +801,22 @@ function CausesContent() {
                     onLoadMore={fetchNextPage}
                   />
                 ) : (
-                  <div className="text-center py-20">
-                    <div className="text-5xl mb-4">
-                      {campaigns.length === 0 ? "📭" : debouncedSearch ? "🔍" : "🔎"}
-                    </div>
-                    <h2 className="text-xl font-semibold text-zinc-900 dark:text-zinc-50 mb-2">
-                      {campaigns.length === 0
-                        ? t("noCausesYet")
-                        : debouncedSearch
-                          ? t("noSearchResults")
-                          : t("noCausesFound")}
-                    </h2>
-                    <p className="text-zinc-600 dark:text-zinc-400 mb-6">
-                      {campaigns.length === 0
-                        ? t("beFirstToSubmit")
-                        : debouncedSearch
-                          ? t("tryDifferentSearch")
-                          : t("tryDifferentKeyword")}
-                    </p>
-                    {campaigns.length > 0 && (
-                      <button
-                        onClick={clearFilters}
-                        className="px-6 py-2 bg-blue-600 text-white rounded-full text-sm font-medium hover:bg-blue-700 transition-colors"
-                      >
-                        {t("clearAllFilters")}
-                      </button>
-                    )}
-                  </div>
+                  renderEmptyState()
                 )}
               </>
             )}
 
             {/* Map view */}
             {viewMode === "map" && (
-              <MapErrorBoundary>
-                <CampaignMap campaigns={filteredCampaigns} />
-              </MapErrorBoundary>
+              filteredCampaigns.length > 0 ? (
+                <MapErrorBoundary>
+                  <CampaignMap campaigns={filteredCampaigns} />
+                </MapErrorBoundary>
+              ) : (
+                renderEmptyState()
+              )
             )}
-          </>
+          </div>
         )}
       </main>
     </div>

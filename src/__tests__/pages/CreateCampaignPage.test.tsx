@@ -52,6 +52,7 @@ jest.mock("next-intl", () => ({
       labelRevenueSharePct: "Revenue Share Percentage",
       cancel: "Cancel",
       launchCampaign: "Launch Campaign",
+      createCause: "Launch Campaign",
       reviewTitle: "Review Campaign Before Signing",
       reviewSubtitle:
         "Launching is irreversible on-chain. Confirm these details before signing in Freighter.",
@@ -60,7 +61,7 @@ jest.mock("next-intl", () => ({
       reviewFieldFundingGoal: "Funding Goal",
       reviewFieldDuration: "Duration",
       reviewFieldDurationDays:
-        values?.count === 1 ? `${values.count} day` : `${values?.count} days`,
+        values?.["count"] === 1 ? `${values["count"]} day` : `${values?.["count"]} days`,
       reviewFieldCategory: "Category",
       reviewFieldRevenueShare: "Revenue Share",
       reviewRevenueShareNone: "0.00% (Not enabled)",
@@ -70,7 +71,7 @@ jest.mock("next-intl", () => ({
       editDetails: "Edit Details",
       confirmAndSign: "Confirm & Sign",
       submitting: "Submitting…",
-      successMessage: `Campaign "${values?.title}" created successfully!`,
+      successMessage: `Campaign "${values?.["title"]}" created successfully!`,
       emailWebhookFailed:
         "Campaign created, but we could not save your optional email subscription.",
       walletRequiredError: "Please connect your Freighter wallet before creating a campaign.",
@@ -338,6 +339,15 @@ describe("CreateCampaignPage — client-side validation", () => {
     await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
     expect(mockCreateCampaign).not.toHaveBeenCalled();
   });
+
+  it("validates form state with all fields filled correctly", async () => {
+    renderPage();
+    await fillRequiredFields();
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    // Should open review dialog instead of showing errors
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -570,9 +580,11 @@ describe("CreateCampaignPage — submission", () => {
     await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
     fireEvent.click(screen.getByRole("button", { name: /confirm & sign/i }));
 
-    expect(await screen.findByRole("button", { name: /submitting/i })).toBeDisabled();
+    const submittingButtons = await screen.findAllByRole("button", { name: /submitting/i });
+    expect(submittingButtons.length).toBeGreaterThan(0);
+    submittingButtons.forEach((button) => expect(button).toBeDisabled());
 
-    await act(async () => {
+    act(() => {
       resolveCreate("tx_hash");
     });
   });
@@ -615,8 +627,8 @@ describe("CreateCampaignPage — cover image upload", () => {
     setWalletConnected();
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ url: "https://ipfs.io/ipfs/QmUploadedHash" }),
-    }) as typeof fetch;
+      json: () => Promise.resolve({ url: "https://ipfs.io/ipfs/QmUploadedHash" }),
+    }) as unknown as typeof fetch;
   });
 
   afterEach(() => {
@@ -647,5 +659,306 @@ describe("CreateCampaignPage — cover image upload", () => {
       await screen.findByDisplayValue("https://ipfs.io/ipfs/QmUploadedHash"),
     ).toBeInTheDocument();
     expect(mockShowSuccess).toHaveBeenCalledWith("coverImageUploadSuccess");
+  });
+
+  it("rejects a 5MB image before upload and explains the limit", async () => {
+    renderPage();
+
+    const file = new File([new Uint8Array(5 * 1024 * 1024)], "too-large.png", {
+      type: "image/png",
+    });
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+
+    await userEvent.upload(fileInput, file);
+
+    expect(mockShowError).toHaveBeenCalledWith("Image must be < 5MB");
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("shows an error when image upload API fails", async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: false,
+      statusText: "Server Error",
+      json: () => Promise.resolve(null),
+    }) as unknown as typeof fetch;
+
+    renderPage();
+
+    const file = new File([new Uint8Array(512).fill(1)], "cover.png", { type: "image/png" });
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+
+    await userEvent.upload(fileInput, file);
+
+    await waitFor(() => {
+      expect(mockShowError).toHaveBeenCalledWith(expect.stringContaining("Failed"));
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Additional form validation edge cases
+// ---------------------------------------------------------------------------
+
+describe("CreateCampaignPage — additional validation edge cases", () => {
+  beforeEach(() => setWalletConnected());
+
+  it("validates creator email format when provided", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    const emailInput = screen.getByLabelText(/creator email/i);
+    await userEvent.type(emailInput, "invalid-email");
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    expect(await screen.findByText(/valid email address/i)).toBeInTheDocument();
+  });
+
+  it("accepts empty creator email field", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    expect(screen.queryByText(/valid email address/i)).not.toBeInTheDocument();
+  });
+
+  it("clamps the revenue share slider to its minimum (0.5%)", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    await userEvent.selectOptions(screen.getByLabelText(/category/i), "1");
+    await userEvent.click(screen.getByRole("switch"));
+
+    const slider = await screen.findByLabelText(/revenue share percentage/i);
+    // The range input sanitizes out-of-bounds values, so the percentage can
+    // never drop below the 0.5% minimum through the UI.
+    fireEvent.change(slider, { target: { value: "0" } });
+
+    expect(slider).toHaveValue("0.5");
+  });
+
+  it("clamps the revenue share slider to its maximum (50%)", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    await userEvent.selectOptions(screen.getByLabelText(/category/i), "1");
+    await userEvent.click(screen.getByRole("switch"));
+
+    const slider = await screen.findByLabelText(/revenue share percentage/i);
+    fireEvent.change(slider, { target: { value: "51" } });
+
+    expect(slider).toHaveValue("50");
+  });
+
+  it("validates Spanish description length when provided", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    const spanishDescInput = screen.getByPlaceholderText(/español/i);
+    fireEvent.change(spanishDescInput, {
+      target: { value: "C".repeat(1001) },
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    expect(await screen.findByText(/1,000 characters or fewer/i)).toBeInTheDocument();
+  });
+
+  it("accepts empty Spanish description", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    const reviewDialog = await screen.findByRole("dialog");
+    expect(reviewDialog).toBeInTheDocument();
+  });
+
+  it("validates tags limit (max 3)", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    const tagsInput = screen.getByPlaceholderText(/add tags/i);
+
+    await userEvent.type(tagsInput, "tag1{Enter}");
+    await userEvent.type(tagsInput, "tag2{Enter}");
+    await userEvent.type(tagsInput, "tag3{Enter}");
+
+    // At the cap the input is removed, so no fourth tag can be entered.
+    expect(screen.queryByPlaceholderText(/add tags/i)).not.toBeInTheDocument();
+    expect(screen.getByText("#tag1")).toBeInTheDocument();
+    expect(screen.getByText("#tag2")).toBeInTheDocument();
+    expect(screen.getByText("#tag3")).toBeInTheDocument();
+  });
+
+  it("allows removing and re-adding tags", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    const tagsInput = screen.getByPlaceholderText(/add tags/i);
+
+    await userEvent.type(tagsInput, "tag1{Enter}");
+    expect(screen.getByText("#tag1")).toBeInTheDocument();
+
+    const removeButton = screen.getByRole("button", { name: /remove tag1/i });
+    await userEvent.click(removeButton);
+
+    expect(screen.queryByText("#tag1")).not.toBeInTheDocument();
+
+    await userEvent.type(tagsInput, "newtag{Enter}");
+    expect(screen.getByText("#newtag")).toBeInTheDocument();
+  });
+
+  it("validates minimum funding goal (greater than 0)", async () => {
+    renderPage();
+    await fillRequiredFields({ fundingGoal: "0" });
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    expect(await screen.findByText(/greater than 0 xlm/i)).toBeInTheDocument();
+  });
+
+  it("validates negative funding goal", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    const fundingInput = screen.getByLabelText(/funding goal/i);
+    await userEvent.clear(fundingInput);
+    await userEvent.type(fundingInput, "-100");
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    expect(await screen.findByText(/greater than 0 xlm/i)).toBeInTheDocument();
+  });
+
+  it("validates duration minimum (1 day)", async () => {
+    renderPage();
+    await fillRequiredFields({ durationDays: "0" });
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    expect(await screen.findByText(/between 1 and 365 days/i)).toBeInTheDocument();
+  });
+
+  it("validates duration maximum (365 days)", async () => {
+    renderPage();
+    await fillRequiredFields({ durationDays: "366" });
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    expect(await screen.findByText(/between 1 and 365 days/i)).toBeInTheDocument();
+  });
+
+  it("clears field error when user corrects the input", async () => {
+    renderPage();
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+    expect(await screen.findByText(/title is required/i)).toBeInTheDocument();
+
+    await userEvent.type(screen.getByLabelText(/campaign title/i), "Valid Title");
+
+    expect(screen.queryByText(/title is required/i)).not.toBeInTheDocument();
+  });
+
+  it("maintains form state when switching between description tabs", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    const descInput = screen.getByLabelText(/description/i);
+    await userEvent.clear(descInput);
+    await userEvent.type(descInput, "English description content");
+
+    // Switch to the preview tab and back; the description must be preserved.
+    await userEvent.click(screen.getByRole("button", { name: "tabPreview" }));
+    await userEvent.click(screen.getByRole("button", { name: "tabWrite" }));
+
+    expect(screen.getByLabelText(/description/i)).toHaveValue("English description content");
+  });
+
+  it("disables submit button during wallet connection", () => {
+    mockWalletState = {
+      publicKey: null,
+      isWalletConnected: false,
+      connectWallet: mockConnectWallet,
+      isLoading: true,
+    };
+
+    renderPage();
+
+    expect(screen.getByRole("button", { name: /launch campaign/i })).toBeDisabled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Review modal interactions
+// ---------------------------------------------------------------------------
+
+describe("CreateCampaignPage — review modal interactions", () => {
+  beforeEach(() => setWalletConnected());
+
+  it("closes review modal when Edit Details is clicked", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    const closeButton = within(screen.getByRole("dialog")).getByRole("button", {
+      name: /edit details/i,
+    });
+    await userEvent.click(closeButton);
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("displays formatted funding goal in review modal", async () => {
+    renderPage();
+    await fillRequiredFields({ fundingGoal: "12345.67" });
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    const reviewDialog = screen.getByRole("dialog");
+    expect(within(reviewDialog).getByText(/12,345\.67 xlm/i)).toBeInTheDocument();
+  });
+
+  it("shows all form field values in review modal", async () => {
+    renderPage();
+
+    const testData = {
+      title: "Unique Campaign Title",
+      description: "Detailed campaign description for review",
+      fundingGoal: "5000",
+      durationDays: "45",
+    };
+
+    await fillRequiredFields(testData);
+
+    await userEvent.type(screen.getByLabelText(/creator email/i), "creator@test.com");
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+
+    const reviewDialog = screen.getByRole("dialog");
+    const reviewScope = within(reviewDialog);
+
+    expect(reviewScope.getByText(testData.title)).toBeInTheDocument();
+    expect(reviewScope.getByText(testData.description)).toBeInTheDocument();
+    expect(reviewScope.getByText(/5,000 xlm/i)).toBeInTheDocument();
+    expect(reviewScope.getByText(/45 days/i)).toBeInTheDocument();
+    expect(reviewScope.getByText("creator@test.com")).toBeInTheDocument();
+  });
+
+  it("handles keyboard navigation for closing review modal (Escape key)", async () => {
+    renderPage();
+    await fillRequiredFields();
+
+    await userEvent.click(screen.getByRole("button", { name: /launch campaign/i }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape", code: "Escape" });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    });
   });
 });

@@ -6,20 +6,41 @@ globalThis.TextEncoder ??= TextEncoder;
 globalThis.TextDecoder ??= TextDecoder;
 
 // jsdom does not implement matchMedia — stub it so components that use
-// motion / framer-motion don't throw.
-Object.defineProperty(window, "matchMedia", {
-  writable: true,
-  value: jest.fn().mockImplementation((query: string) => ({
-    matches: false,
-    media: query,
-    onchange: null,
-    addListener: jest.fn(),
-    removeListener: jest.fn(),
-    addEventListener: jest.fn(),
-    removeEventListener: jest.fn(),
-    dispatchEvent: jest.fn(),
-  })),
-});
+// motion / framer-motion don't throw. Some suites run under
+// `@jest-environment node` (e.g. API route tests), where `window` is
+// undefined; skip the DOM stub there.
+if (typeof window !== "undefined") {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: jest.fn().mockImplementation((query: string) => ({
+      matches: false,
+      media: query,
+      onchange: null,
+      addListener: jest.fn(),
+      removeListener: jest.fn(),
+      addEventListener: jest.fn(),
+      removeEventListener: jest.fn(),
+      dispatchEvent: jest.fn(),
+    })),
+  });
+}
+
+// jsdom does not implement PointerEvent — tooltip/touch tests need to be able
+// to dispatch pointer events carrying a `pointerType` (#1154).
+if (typeof window !== "undefined" && typeof window.PointerEvent === "undefined") {
+  class PointerEventStub extends MouseEvent {
+    readonly pointerType: string;
+    readonly pointerId: number;
+
+    constructor(type: string, params: PointerEventInit = {}) {
+      super(type, params);
+      this.pointerType = params.pointerType ?? "";
+      this.pointerId = params.pointerId ?? 0;
+    }
+  }
+
+  window.PointerEvent = PointerEventStub as unknown as typeof PointerEvent;
+}
 
 // jsdom does not implement Intl.DisplayNames — stub it so locale-aware
 // components can render their language labels in tests.
@@ -46,7 +67,9 @@ globalThis.ResizeObserver ??= ResizeObserverStub;
 
 // jsdom doesn't implement scrollTo; the window virtualizer calls it when
 // asked to scroll to an offset.
-window.scrollTo ??= () => {};
+if (typeof window !== "undefined") {
+  window.scrollTo ??= () => {};
+}
 
 // Global mock for Freighter API (v6.x returns objects, not primitives)
 jest.mock("@stellar/freighter-api", () => ({

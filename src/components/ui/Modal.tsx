@@ -1,7 +1,13 @@
 "use client";
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, memo } from "react";
 import { cn } from "./cn";
+
+const FOCUSABLE_SELECTOR =
+  'a[href]:not([tabindex="-1"]), button:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])';
+
+const FORM_FIELD_SELECTOR =
+  'input:not([disabled]):not([tabindex="-1"]):not([type="hidden"]):not([type="button"]):not([type="submit"]):not([type="reset"]), select:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"])';
 
 export interface ModalProps {
   isOpen?: boolean;
@@ -20,10 +26,13 @@ export interface ModalProps {
 /**
  * Shared Modal Shell Component
  *
- * Provides a accessible dialog backdrop, focus trap, Escape key handling,
+ * Provides an accessible dialog backdrop, focus trap, Escape key handling,
  * body scroll locking, focus restoration, and standard dialog attributes.
+ *
+ * Initial focus prefers the first form field (input/select/textarea) so
+ * keyboard users can fill donation and other forms without tab order gaps.
  */
-export default function Modal({
+function Modal({
   isOpen = true,
   onClose,
   children,
@@ -47,14 +56,17 @@ export default function Modal({
     const originalOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
 
-    // Set initial focus to provided ref, first focusable child, or modal container
+    // Set initial focus to provided ref, first form field, first focusable, or modal
     const timer = setTimeout(() => {
       if (initialFocusRef?.current) {
         initialFocusRef.current.focus();
       } else if (modalRef.current) {
-        const focusable = modalRef.current.querySelectorAll<HTMLElement>(
-          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
-        );
+        const formField = modalRef.current.querySelector<HTMLElement>(FORM_FIELD_SELECTOR);
+        if (formField) {
+          formField.focus();
+          return;
+        }
+        const focusable = modalRef.current.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
         if (focusable.length > 0) {
           focusable[0].focus();
         } else {
@@ -84,11 +96,8 @@ export default function Modal({
       }
 
       if (e.key === "Tab" && modalRef.current) {
-        const focusable = Array.from(
-          modalRef.current.querySelectorAll<HTMLElement>(
-            'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])',
-          ),
-        );
+        const scope = modalRef.current;
+        const focusable = Array.from(scope.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR));
         if (focusable.length === 0) {
           e.preventDefault();
           return;
@@ -96,23 +105,16 @@ export default function Modal({
 
         const first = focusable[0];
         const last = focusable[focusable.length - 1];
+        const active = document.activeElement;
 
         if (e.shiftKey) {
-          if (
-            document.activeElement === first ||
-            !modalRef.current.contains(document.activeElement)
-          ) {
+          if (active === first || !scope.contains(active)) {
             e.preventDefault();
             last.focus();
           }
-        } else {
-          if (
-            document.activeElement === last ||
-            !modalRef.current.contains(document.activeElement)
-          ) {
-            e.preventDefault();
-            first.focus();
-          }
+        } else if (active === last || !scope.contains(active)) {
+          e.preventDefault();
+          first.focus();
         }
       }
     };
@@ -156,3 +158,5 @@ export default function Modal({
     </div>
   );
 }
+
+export default memo(Modal);
